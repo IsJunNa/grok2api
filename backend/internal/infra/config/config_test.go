@@ -265,6 +265,19 @@ func TestValidateRejectsExampleSecrets(t *testing.T) {
 	}
 }
 
+func TestNormalizeStatsigSignerURLMigratesDeprecatedDefault(t *testing.T) {
+	if got := NormalizeStatsigSignerURL(DeprecatedStatsigSignerURL); got != DefaultStatsigSignerURL {
+		t.Fatalf("deprecated default = %q, want %q", got, DefaultStatsigSignerURL)
+	}
+	if got := NormalizeStatsigSignerURL(""); got != DefaultStatsigSignerURL {
+		t.Fatalf("empty = %q, want %q", got, DefaultStatsigSignerURL)
+	}
+	custom := "http://custom-signer:8788/sign"
+	if got := NormalizeStatsigSignerURL(custom); got != custom {
+		t.Fatalf("custom URL rewritten: %q", got)
+	}
+}
+
 func TestValidateStatsigModes(t *testing.T) {
 	base := defaultConfig()
 	base.Secrets.JWTSecret = "12345678901234567890123456789012"
@@ -283,7 +296,7 @@ func TestValidateStatsigModes(t *testing.T) {
 
 	remote := base
 	remote.Provider.Web.StatsigMode = StatsigModeURL
-	remote.Provider.Web.StatsigSignerURL = "http://grok-signer-go:8788/sign"
+	remote.Provider.Web.StatsigSignerURL = "http://statsig-signer:3000/sign"
 	if err := remote.Validate(); err != nil {
 		t.Fatalf("Docker internal Statsig signer rejected: %v", err)
 	}

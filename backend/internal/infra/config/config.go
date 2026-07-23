@@ -23,7 +23,9 @@ const (
 	StatsigModeURL                = "url"
 	ClearanceModeManual           = "manual"
 	ClearanceModeFlareSolverr     = "flaresolverr"
-	DefaultStatsigSignerURL       = "https://grok.wodf.de/sign"
+	DefaultStatsigSignerURL       = "http://statsig-signer:3000/sign"
+	// 历史默认公网签名站已被 Cloudflare 拦截；加载旧运行设置时自动迁移。
+	DeprecatedStatsigSignerURL    = "https://grok.wodf.de/sign"
 	DefaultFlareSolverrURL        = "http://flaresolverr:8191"
 	RecommendedBuildClientVersion = "0.2.106"
 	RecommendedBuildUserAgent     = "grok-shell/" + RecommendedBuildClientVersion + " (linux; x86_64)"
@@ -687,6 +689,16 @@ func validStatsigID(value string) bool {
 		decoded, err = base64.StdEncoding.DecodeString(value)
 	}
 	return err == nil && len(decoded) == 70
+}
+
+// NormalizeStatsigSignerURL 将已失效的历史默认公网签名站迁移到本地无头浏览器签名机。
+// 用户自定义的其他签名 URL 保持不变。
+func NormalizeStatsigSignerURL(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" || strings.EqualFold(value, DeprecatedStatsigSignerURL) {
+		return DefaultStatsigSignerURL
+	}
+	return value
 }
 
 func validCredentialEncryptionKey(value string) bool {

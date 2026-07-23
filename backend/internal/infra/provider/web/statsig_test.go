@@ -57,6 +57,69 @@ func TestStatsigSignerSendsMethodPathAndMetaContent(t *testing.T) {
 	}
 }
 
+func TestStatsigSignerAcceptsHeadlessBrowserResponseField(t *testing.T) {
+	raw := make([]byte, 70)
+	raw[0] = 7
+	encoded := base64.RawStdEncoding.EncodeToString(raw)
+	signer := newStatsigSigner()
+	signer.validateEndpoint = func(context.Context, string) error { return nil }
+	var gotPayload map[string]any
+	signer.client = &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		if err := json.NewDecoder(request.Body).Decode(&gotPayload); err != nil {
+			t.Fatal(err)
+		}
+		body, _ := json.Marshal(map[string]string{"statsig": encoded})
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(string(body))), Header: http.Header{}}, nil
+	})}
+	value, err := signer.requestSignature(context.Background(), "http://statsig-signer:3000/sign", "POST", "/rest/app-chat/conversations/new", "")
+	if err != nil || value != encoded {
+		t.Fatalf("value=%q err=%v", value, err)
+	}
+	if _, ok := gotPayload["environment"]; ok {
+		t.Fatalf("empty meta must omit environment: %#v", gotPayload)
+	}
+	if gotPayload["method"] != "POST" || gotPayload["path"] != "/rest/app-chat/conversations/new" {
+		t.Fatalf("payload=%#v", gotPayload)
+	}
+}
+
+func TestParseStatsigSignatureResponseAcceptsBothFields(t *testing.T) {
+	raw := make([]byte, 70)
+	encoded := base64.RawStdEncoding.EncodeToString(raw)
+	for _, body := range []string{
+		`{"x-statsig-id":"` + encoded + `"}`,
+		`{"statsig":"` + encoded + `"}`,
+		`{"statsig":"` + encoded + `","x-statsig-id":"invalid"}`,
+	} {
+		value, ok := parseStatsigSignatureResponse([]byte(body))
+		if !ok || value != encoded {
+			t.Fatalf("body=%s value=%q ok=%v", body, value, ok)
+		}
+	}
+	if _, ok := parseStatsigSignatureResponse([]byte(`{"statsig":"invalid"}`)); ok {
+		t.Fatal("invalid signature accepted")
+	}
+}
+
+func TestFreshSignatureContinuesWhenMetaFetchFails(t *testing.T) {
+	raw := make([]byte, 70)
+	raw[1] = 9
+	encoded := base64.RawStdEncoding.EncodeToString(raw)
+	signer := newStatsigSigner()
+	signer.validateEndpoint = func(context.Context, string) error { return nil }
+	signer.fetchMeta = func(context.Context, string, string, *infraegress.Lease) (string, error) {
+		return "", errors.New("index blocked")
+	}
+	signer.client = &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		body, _ := json.Marshal(map[string]string{"statsig": encoded})
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(string(body))), Header: http.Header{}}, nil
+	})}
+	value, err := signer.freshSignature(context.Background(), "https://grok.com", "http://statsig-signer:3000/sign", "token", nil, http.MethodPost, "/rest/test")
+	if err != nil || value != encoded {
+		t.Fatalf("value=%q err=%v", value, err)
+	}
+}
+
 func TestStatsigSignerRejectsInvalidShape(t *testing.T) {
 	signer := newStatsigSigner()
 	signer.validateEndpoint = func(context.Context, string) error { return nil }
@@ -70,8 +133,8 @@ func TestStatsigSignerRejectsInvalidShape(t *testing.T) {
 
 func TestValidateStatsigSignerEndpointUsesAdminURLBoundary(t *testing.T) {
 	for _, endpoint := range []string{
-		"https://grok.wodf.de/sign",
 		"https://signer.example/sign",
+		"http://statsig-signer:3000/sign",
 		"http://grok-signer-go:8788/sign",
 		"http://host.docker.internal:8788/sign",
 		"http://127.0.0.1:8788/sign",
@@ -82,10 +145,10 @@ func TestValidateStatsigSignerEndpointUsesAdminURLBoundary(t *testing.T) {
 		}
 	}
 	for _, endpoint := range []string{
-		"http://grok.wodf.de/sign",
-		"https://user:pass@grok.wodf.de/sign",
-		"https://grok.wodf.de:8443/sign",
-		"https://grok.wodf.de/sign?token=value",
+		"http://signer.example/sign",
+		"https://user:pass@signer.example/sign",
+		"https://signer.example:8443/sign",
+		"https://signer.example/sign?token=value",
 		"http://8.8.8.8:8788/sign",
 	} {
 		if err := validateStatsigSignerEndpoint(context.Background(), endpoint); err == nil {

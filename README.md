@@ -172,13 +172,28 @@ Start the service:
 
 ```bash
 docker compose pull
-docker compose up -d
+docker compose up -d --build
 docker compose logs -f grok2api
 ```
 
 The admin console is available at `http://127.0.0.1:8000` by default.
 
 Compose mounts `config.yaml` read-only and stores the SQLite database and local media in the `grok2api-data` volume. The image already contains the frontend; no separate web deployment is required.
+
+### Grok Web 403 and x-statsig-id
+
+Grok Web requires a valid `x-statsig-id` on API requests. The previous public signer endpoint is now blocked by Cloudflare, which surfaces as 403 / anti-bot failures.
+
+By default this repo starts a local **statsig-signer** (headless Chromium) on the same Compose network:
+
+1. `docker compose up -d --build` starts both `grok2api` and `statsig-signer`
+2. In admin **Runtime settings → Grok Web**, keep Statsig mode as **URL**
+3. Set the signer URL to `http://statsig-signer:3000/sign` (the default for new installs)
+4. If Grok Web egress uses a proxy, set `STATSIG_PROXY_URL` so the signer shares the same path
+
+The signer adds roughly 0.5GB memory; CPU is capped at 0.5 by default and can be raised in `docker-compose.yml`. If you only use Grok Build, you can stop `statsig-signer` and switch Statsig to manual mode.
+
+On occasional 403s the Web provider invalidates the cached signature and retries once; remaining anti-bot failures are treated as egress issues and rotate accounts instead of permanently banning them.
 
 Common maintenance commands:
 

@@ -11,11 +11,37 @@ services:
     volumes:
       - "${GROK2API_CONFIG:-./config.yaml}:/run/grok2api/config.yaml:ro"
       - grok2api-data:/app/data
+    depends_on:
+      - statsig-signer
     restart: unless-stopped
     init: true
     stop_grace_period: 30s
     security_opt:
       - no-new-privileges:true
+
+  # Grok Web 反爬需要有效的 x-statsig-id。无头浏览器签名机在本地跑 grok 页面 JS 动态签名，
+  # 解决默认公网签名站被 Cloudflare 拦截后的 403。约额外占用 ~0.5GB 内存。
+  # 管理端「运行设置 → Grok Web → x-statsig 获取方式」保持 URL 模式，
+  # 签名服务地址默认：http://statsig-signer:3000/sign
+  statsig-signer:
+    container_name: statsig-signer
+    build:
+      context: ./statsig-signer
+    image: "${STATSIG_SIGNER_IMAGE:-grok2api-statsig-signer:local}"
+    init: true
+    environment:
+      TZ: "${TZ:-Asia/Shanghai}"
+      PORT: "3000"
+      # 可选：强制指定 SSO；留空时签名机仅依赖自身浏览器会话（签名不绑定账号身份）。
+      GROK_SSO_TOKEN: "${GROK_SSO_TOKEN:-}"
+      # 若 Grok Web 出口使用代理，签名机也应走同一代理，否则 CF 指纹不一致。
+      PROXY_URL: "${STATSIG_PROXY_URL:-}"
+    restart: unless-stopped
+    # 无头 Chromium 常驻会吃 CPU；签名有缓存，0.5 核通常足够，签名变慢时可调高。
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
 
   # 如果出口 IP 不干净，可取消以下注释使用 WARP 作为落地代理。
   # 启用后，在管理端“设置 -> 出口代理”中新增 socks5://warp:1080。

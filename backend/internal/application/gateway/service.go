@@ -695,25 +695,64 @@ attemptLoop:
 				continue
 			}
 		}
-		egressForbidden := s.providers.RetryForbiddenAsEgress(credential.Provider) && response.StatusCode == http.StatusForbidden
-		finalEgressForbidden := egressForbidden && (attempt > 0 || attempt+1 >= attempts)
-		if isRetryableResponse(response, route.Provider) && !finalEgressForbidden {
+		if isRetryableResponse(response, route.Provider) {
 			retryAfter := parseRetryAfter(response.Header.Get("Retry-After"), time.Now().UTC())
 			body, _ := readRetryableBody(response.Body)
-			if egressForbidden {
-				// Web 403/code 7 means the browser session at the egress was rejected; the Provider rebuilt it and reduced node health, so do not penalize the account.
-				delete(excluded, credential.ID)
-				lease.Release()
-				lastErr = fmt.Errorf("Grok Web 出口会话被反机器人规则拒绝")
-				lastFailure = newHTTPUpstreamFailure(response.StatusCode, body, credential.ID, credential.Name)
-				continue
-			}
 			lastFailure = newHTTPUpstreamFailure(response.StatusCode, body, credential.ID, credential.Name)
-			// The adapter only allows auto Super accounts to fall back to XAI within the same request;
-			// 403 from non-Super accounts triggers account-level cooldown and rotation.
-			freeBuildForbidden := response.StatusCode == http.StatusForbidden && credential.Provider == accountdomain.ProviderBuild && !accountdomain.IsBuildSuper(credential, lease.Billing)
-			if freeBuildForbidden {
-				lastFailure.AccountScoped = true
+			// 聊天链路遇到 403：默认停用当前账号并换号，避免坏号反复被选中。
+			// Web Provider 内部仍会先失效 Statsig 并重试一次；走到网关的 403 视为该账号本次不可用。
+			// Build 的「单模型 chat 拒绝」例外：只隔离模型，保留 OAuth 与视频能力。
+			if response.StatusCode == http.StatusForbidden {
+				if s.providers.SupportsCredentialRefresh(credential.Provider) && !authRecoveryAttempted[credential.ID] && credential.EncryptedRefreshToken != "" && (lastFailure.PermanentAccountDenial || lastFailure.CredentialRejected) {
+					authRecoveryAttempted[credential.ID] = true
+					refreshed, refreshErr := ensureCredential(credential, true)
+					if refreshErr != nil {
+						if credential.Provider == accountdomain.ProviderBuild && lastFailure.PermanentAccountDenial {
+							s.selector.MarkModelAccessDenied(ctx, credential, route.UpstreamModel, retryAfter)
+						} else {
+							s.disableAccountAfterChatForbidden(ctx, credential, body)
+						}
+						lease.Release()
+						lastErr = refreshErr
+						lastFailure = newCredentialUpstreamFailure(refreshErr, credential.ID, credential.Name)
+						continue attemptLoop
+					}
+					response, err = forwardResponse(lease, refreshed, lease.Billing)
+					credential = refreshed
+					if err != nil {
+						if credential.Provider != accountdomain.ProviderBuild || !lastFailure.PermanentAccountDenial {
+							s.disableAccountAfterChatForbidden(ctx, credential, body)
+						}
+						lease.Release()
+						lastErr = err
+						if ctx.Err() != nil || errors.Is(err, context.Canceled) {
+							lastFailure = &UpstreamFailure{HTTPStatus: 499, Code: "request_canceled", PublicMessage: "请求已取消", AccountID: credential.ID, AccountName: credential.Name, Cause: firstError(ctx.Err(), err)}
+							break attemptLoop
+						}
+						lastFailure = newTransportUpstreamFailure(err, credential.ID, credential.Name)
+						if !isRetryableTransportFailure(credential.Provider, err) {
+							break attemptLoop
+						}
+						continue attemptLoop
+					}
+					if response.StatusCode != http.StatusForbidden {
+						goto handleResponse
+					}
+					body, _ = readRetryableBody(response.Body)
+					lastFailure = newHTTPUpstreamFailure(response.StatusCode, body, credential.ID, credential.Name)
+				}
+				if credential.Provider == accountdomain.ProviderBuild && lastFailure.PermanentAccountDenial {
+					s.selector.MarkModelAccessDenied(ctx, credential, route.UpstreamModel, retryAfter)
+					lease.Release()
+					lastErr = fmt.Errorf("上游返回 403")
+					s.logger.Warn("upstream_request_failed", "request_id", input.RequestID, "account_id", credential.ID, "provider", credential.Provider, "status", response.StatusCode, "upstream_code", lastFailure.UpstreamCode, "account_scoped", true, "model_scoped", true)
+					continue
+				}
+				s.disableAccountAfterChatForbidden(ctx, credential, body)
+				lease.Release()
+				lastErr = fmt.Errorf("上游返回 403，账号已停用")
+				s.logger.Warn("upstream_forbidden_account_disabled", "request_id", input.RequestID, "account_id", credential.ID, "provider", credential.Provider, "upstream_code", lastFailure.UpstreamCode)
+				continue
 			}
 			if response.StatusCode == http.StatusTooManyRequests && response.RateLimit != nil && response.RateLimit.TeamID != "" && response.RateLimit.Model == route.UpstreamModel {
 				limited := s.markTeamModelRateLimit(credential, route.UpstreamModel, *response.RateLimit, time.Now().UTC())
@@ -752,10 +791,7 @@ attemptLoop:
 				goto handleResponse
 			}
 			failureHandled := false
-			if freeBuildForbidden {
-				s.selector.MarkFailure(ctx, credential, response.StatusCode, retryAfter)
-				failureHandled = true
-			} else if lease.QuotaMode != "" && response.StatusCode == http.StatusTooManyRequests {
+			if lease.QuotaMode != "" && response.StatusCode == http.StatusTooManyRequests {
 				exhausted, reconcileErr := s.accounts.ReconcileRateLimit(ctx, credential.ID, lease.QuotaMode, retryAfter)
 				s.selector.MarkQuotaStateChanged(credential.Provider)
 				failureHandled = reconcileErr == nil && exhausted
@@ -987,6 +1023,23 @@ func (s *Service) markSSOCredentialRejected(ctx context.Context, credential acco
 	}
 	// Discard the process-local one-second candidate snapshot even if persistence fails,
 	// preventing the invalid account from being selected by the next request.
+	s.selector.MarkQuotaStateChanged(credential.Provider)
+}
+
+// disableAccountAfterChatForbidden 在聊天上游返回 403 后停用账号并失效调度缓存，随后由 attempt 循环换号。
+func (s *Service) disableAccountAfterChatForbidden(ctx context.Context, credential accountdomain.Credential, body []byte) {
+	reason := "聊天上游返回 403，账号已自动停用"
+	if code, _, message := extractUpstreamErrorMetadata(body); code != "" || message != "" {
+		detail := strings.TrimSpace(firstNonEmptyFailure(code, message))
+		if detail != "" {
+			reason = "聊天上游返回 403: " + detail
+		}
+	}
+	writeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), finalizationTimeout)
+	defer cancel()
+	if err := s.accounts.Disable(writeCtx, credential.ID, reason); err != nil {
+		s.logger.Error("account_disable_after_forbidden_failed", "account_id", credential.ID, "provider", credential.Provider, "error", err)
+	}
 	s.selector.MarkQuotaStateChanged(credential.Provider)
 }
 
@@ -1234,9 +1287,12 @@ func isRetryableResponse(response *provider.Response, upstreamProvider accountdo
 	return !strings.EqualFold(strings.TrimSpace(response.Header.Get("X-Should-Retry")), "false")
 }
 
-// forcesAccountFailover scopes the Build billing-wall override to the Provider
-// whose 402 contract is known. Other Providers continue honoring X-Should-Retry.
+// forcesAccountFailover 在已知需要账号级切换时忽略上游 X-Should-Retry:false。
+// Build 的 402 账单墙与所有 Provider 的聊天 403 都会强制换号。
 func forcesAccountFailover(status int, upstreamProvider accountdomain.Provider) bool {
+	if status == http.StatusForbidden {
+		return true
+	}
 	return upstreamProvider == accountdomain.ProviderBuild && status == http.StatusPaymentRequired
 }
 

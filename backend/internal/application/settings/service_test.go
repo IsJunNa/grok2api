@@ -296,6 +296,21 @@ func TestLoadPersistedRejectsIncompleteStatsigPayload(t *testing.T) {
 	}
 }
 
+func TestLoadPersistedMigratesDeprecatedPublicStatsigSigner(t *testing.T) {
+	cfg := testConfig(t)
+	value := toDomainConfig(cfg)
+	value.ProviderWeb.StatsigMode = config.StatsigModeURL
+	value.ProviderWeb.StatsigSignerURL = config.DeprecatedStatsigSignerURL
+	repository := &runtimeSettingsRepositoryStub{value: value, found: true}
+	loaded, _, _, err := LoadPersisted(context.Background(), cfg, repository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.Provider.Web.StatsigSignerURL != config.DefaultStatsigSignerURL {
+		t.Fatalf("StatsigSignerURL = %q, want %q", loaded.Provider.Web.StatsigSignerURL, config.DefaultStatsigSignerURL)
+	}
+}
+
 func TestLoadPersistedRejectsIncompleteBatchPayload(t *testing.T) {
 	cfg := testConfig(t)
 	value := toDomainConfig(cfg)

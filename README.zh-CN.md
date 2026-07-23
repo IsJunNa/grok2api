@@ -173,13 +173,28 @@ bootstrapAdmin:
 
 ```bash
 docker compose pull
-docker compose up -d
+docker compose up -d --build
 docker compose logs -f grok2api
 ```
 
 管理端默认地址：`http://127.0.0.1:8000`。
 
 Compose 会将 `config.yaml` 只读挂载到容器，并使用 `grok2api-data` 保存 SQLite 数据库和本地媒体。镜像已经包含前端，无需单独部署 Web 服务。
+
+### Grok Web 403 与 x-statsig-id
+
+Grok Web 上游对请求强制校验 `x-statsig-id`。公网默认签名站现已被 Cloudflare 拦截，直接调用会得到 403 / anti-bot。
+
+本仓库默认通过同网络中的 **statsig-signer**（无头 Chromium）动态获取真实签名：
+
+1. `docker compose up -d --build` 会同时启动 `grok2api` 与 `statsig-signer`
+2. 管理端 **运行设置 → Grok Web → x-statsig 获取方式** 选择「URL 获取」
+3. 签名服务 URL 使用 `http://statsig-signer:3000/sign`（新安装默认值）
+4. 若 Web 出口配置了代理，请同步设置环境变量 `STATSIG_PROXY_URL`，保证签名机与业务出口一致
+
+签名机约额外占用 0.5GB 内存；CPU 默认限制 0.5 核，可按机器性能在 `docker-compose.yml` 中调整。仅使用 Grok Build、不调用 Web 时，可自行停掉 `statsig-signer` 并将 Statsig 模式改为手动。
+
+偶发 403 时，网关会在 Provider 内失效签名缓存并重试一次；仍失败时会按出口反爬故障切换账号，而不是直接把账号判死。
 
 常用维护命令：
 

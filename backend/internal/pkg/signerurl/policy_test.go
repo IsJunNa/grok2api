@@ -4,7 +4,8 @@ import "testing"
 
 func TestValidateAllowsPublicHTTPSAndTrustedInternalSigner(t *testing.T) {
 	for _, value := range []string{
-		"https://grok.wodf.de/sign",
+		"https://signer.example/sign",
+		"http://statsig-signer:3000/sign",
 		"http://grok-signer-go:8788/sign",
 		"http://localhost:8788/sign",
 		"http://host.docker.internal:8788/sign",
@@ -20,11 +21,11 @@ func TestValidateAllowsPublicHTTPSAndTrustedInternalSigner(t *testing.T) {
 
 func TestValidateRejectsUnsafeOrMalformedSigner(t *testing.T) {
 	for _, value := range []string{
-		"http://grok.wodf.de/sign",
-		"https://grok.wodf.de:8443/sign",
-		"https://user:pass@grok.wodf.de/sign",
-		"https://grok.wodf.de/sign?token=value",
-		"https://grok.wodf.de/sign#fragment",
+		"http://signer.example/sign",
+		"https://signer.example:8443/sign",
+		"https://user:pass@signer.example/sign",
+		"https://signer.example/sign?token=value",
+		"https://signer.example/sign#fragment",
 		"ftp://grok-signer-go/sign",
 		"http://8.8.8.8:8788/sign",
 		"grok-signer-go:8788/sign",

@@ -1692,6 +1692,29 @@ func (s *Service) MarkReauthRequired(ctx context.Context, id uint64, reason stri
 	return nil
 }
 
+// Disable 将账号停用并记录原因，使其立即退出调度池；可在管理端重新启用。
+func (s *Service) Disable(ctx context.Context, id uint64, reason string) error {
+	value, err := s.accounts.Get(ctx, id)
+	if err != nil {
+		return mapRepositoryError(err)
+	}
+	value.Enabled = false
+	reason = strings.TrimSpace(reason)
+	if reason != "" {
+		value.LastError = reason
+		if len(value.LastError) > 512 {
+			value.LastError = value.LastError[:512]
+		}
+	}
+	if _, err := s.accounts.Update(ctx, value); err != nil {
+		return mapRepositoryError(err)
+	}
+	if s.sticky != nil {
+		_ = s.sticky.DeleteByAccount(ctx, id)
+	}
+	return nil
+}
+
 // markSSOCredentialRejected 在上游明确返回 401 后可靠持久化失效状态。
 // 状态写入不继承客户端取消，避免已经确认失效的账号因请求断开继续留在号池。
 func (s *Service) markSSOCredentialRejected(ctx context.Context, value accountdomain.Credential, reason string) error {

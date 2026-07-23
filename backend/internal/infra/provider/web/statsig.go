@@ -22,7 +22,8 @@ import (
 )
 
 const (
-	defaultStatsigSignerURL = "https://grok.wodf.de/sign"
+	// 默认指向同 compose 网络中的无头浏览器签名服务；公网默认签名站已受 CF 拦截。
+	defaultStatsigSignerURL = "http://statsig-signer:3000/sign"
 	statsigCacheTTL         = time.Hour
 	statsigCacheMaxEntries  = 4096
 	statsigMetaBodyLimit    = 4 << 20
@@ -97,7 +98,8 @@ func (s *statsigSigner) Sign(ctx context.Context, baseURL, signerURL, token stri
 	return result.value, result.source, nil
 }
 
-// Warm 使用一次 metaContent 请求预热多个常用签名键，避免按账号或按路径重复抓取首页。
+// Warm 预热多个常用签名键。metaContent 为尽力获取：无头浏览器签名机不依赖它，
+// 仅部分远程签名服务需要；meta 失败时仍继续签名，避免首页被 CF 拦截后整链不可用。
 func (s *statsigSigner) Warm(ctx context.Context, baseURL, signerURL, token string, lease *infraegress.Lease, targets []statsigWarmTarget) (int, error) {
 	now := s.now().UTC()
 	type pendingTarget struct {
@@ -119,13 +121,14 @@ func (s *statsigSigner) Warm(ctx context.Context, baseURL, signerURL, token stri
 	if len(pending) == 0 {
 		return 0, nil
 	}
-	meta, err := s.fetchMeta(ctx, baseURL, token, lease)
-	if err != nil {
-		return 0, err
-	}
+	meta, _ := s.fetchMeta(ctx, baseURL, token, lease)
 	warmed := 0
 	for _, target := range pending {
 		value, signErr := s.requestSignature(ctx, signerURL, target.method, target.path, meta)
+		if signErr != nil && meta != "" {
+			// 远程签名失败时再试一次无 meta，兼容只吃 path/method 的无头浏览器签名机。
+			value, signErr = s.requestSignature(ctx, signerURL, target.method, target.path, "")
+		}
 		if signErr != nil {
 			return warmed, signErr
 		}
@@ -136,24 +139,26 @@ func (s *statsigSigner) Warm(ctx context.Context, baseURL, signerURL, token stri
 }
 
 func (s *statsigSigner) freshSignature(ctx context.Context, baseURL, signerURL, token string, lease *infraegress.Lease, method, path string) (string, error) {
-	meta, err := s.fetchMeta(ctx, baseURL, token, lease)
-	if err != nil {
-		return "", err
-	}
+	// metaContent 尽力获取：无头浏览器签名机只需要 method/path。
+	meta, _ := s.fetchMeta(ctx, baseURL, token, lease)
 	signature, err := s.requestSignature(ctx, signerURL, method, path, meta)
 	if err == nil {
 		return signature, nil
 	}
-
-	meta, refreshErr := s.fetchMeta(ctx, baseURL, token, lease)
-	if refreshErr != nil {
-		return "", fmt.Errorf("刷新 Statsig metaContent: %w", refreshErr)
+	if meta != "" {
+		if signature, retryErr := s.requestSignature(ctx, signerURL, method, path, ""); retryErr == nil {
+			return signature, nil
+		}
+		meta, refreshErr := s.fetchMeta(ctx, baseURL, token, lease)
+		if refreshErr == nil {
+			signature, retryErr := s.requestSignature(ctx, signerURL, method, path, meta)
+			if retryErr == nil {
+				return signature, nil
+			}
+			err = retryErr
+		}
 	}
-	signature, retryErr := s.requestSignature(ctx, signerURL, method, path, meta)
-	if retryErr != nil {
-		return "", fmt.Errorf("Statsig 签名失败: %w", retryErr)
-	}
-	return signature, nil
+	return "", fmt.Errorf("Statsig 签名失败: %w", err)
 }
 
 func (s *statsigSigner) Invalidate(baseURL, signerURL, method, target string) {
@@ -227,14 +232,16 @@ func (s *statsigSigner) requestSignature(ctx context.Context, endpoint, method, 
 	if err := s.validateEndpoint(ctx, endpoint); err != nil {
 		return "", err
 	}
-	payload, _ := json.Marshal(map[string]any{
+	payload := map[string]any{
 		"method": strings.ToUpper(strings.TrimSpace(method)),
 		"path":   path,
-		"environment": map[string]string{
-			"metaContent": metaContent,
-		},
-	})
-	request, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(payload))
+	}
+	// 仅在拿到 meta 时附带 environment，兼容只消费 path/method 的无头浏览器签名机。
+	if meta := strings.TrimSpace(metaContent); meta != "" {
+		payload["environment"] = map[string]string{"metaContent": meta}
+	}
+	bodyBytes, _ := json.Marshal(payload)
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(bodyBytes))
 	if err != nil {
 		return "", err
 	}
@@ -254,13 +261,30 @@ func (s *statsigSigner) requestSignature(ctx context.Context, endpoint, method, 
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
 		return "", fmt.Errorf("签名服务返回 %d", response.StatusCode)
 	}
-	var value struct {
-		StatsigID string `json:"x-statsig-id"`
-	}
-	if json.Unmarshal(body, &value) != nil || !validStatsigID(value.StatsigID) {
+	statsigID, ok := parseStatsigSignatureResponse(body)
+	if !ok {
 		return "", fmt.Errorf("签名服务响应无效")
 	}
-	return value.StatsigID, nil
+	return statsigID, nil
+}
+
+// parseStatsigSignatureResponse 兼容两种签名机响应：
+//   - 远程/自建 Go 签名：{"x-statsig-id":"..."}
+//   - 无头浏览器签名机：{"statsig":"..."}
+func parseStatsigSignatureResponse(body []byte) (string, bool) {
+	var value struct {
+		StatsigID string `json:"x-statsig-id"`
+		Statsig   string `json:"statsig"`
+	}
+	if json.Unmarshal(body, &value) != nil {
+		return "", false
+	}
+	for _, candidate := range []string{value.StatsigID, value.Statsig} {
+		if validStatsigID(candidate) {
+			return strings.TrimSpace(candidate), true
+		}
+	}
+	return "", false
 }
 
 func validateStatsigSignerEndpoint(ctx context.Context, endpoint string) error {

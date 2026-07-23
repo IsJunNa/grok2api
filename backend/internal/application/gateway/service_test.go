@@ -816,7 +816,7 @@ func TestParseFreeQuotaExhaustion(t *testing.T) {
 	}
 }
 
-func TestGatewayCoolsFreeBuildAccountsAfterForbidden(t *testing.T) {
+func TestGatewayDisablesAccountsAfterChatForbidden(t *testing.T) {
 	ctx := context.Background()
 	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "systemic-forbidden.db"))
 	if err != nil {
@@ -874,7 +874,7 @@ func TestGatewayCoolsFreeBuildAccountsAfterForbidden(t *testing.T) {
 	if !errors.As(err, &upstreamFailure) || errors.Is(err, ErrNoAvailableAccount) {
 		t.Fatalf("error = %T %v", err, err)
 	}
-	if upstreamFailure.HTTPStatus != http.StatusForbidden || upstreamFailure.Code != "upstream_forbidden" || !upstreamFailure.AccountScoped {
+	if upstreamFailure.HTTPStatus != http.StatusForbidden || upstreamFailure.Code != "upstream_forbidden" {
 		t.Fatalf("upstream failure = %#v", upstreamFailure)
 	}
 	attempts := adapter.Attempts()
@@ -886,13 +886,105 @@ func TestGatewayCoolsFreeBuildAccountsAfterForbidden(t *testing.T) {
 		if getErr != nil {
 			t.Fatal(getErr)
 		}
-		if observed.FailureCount != 1 || observed.CooldownUntil == nil || observed.AuthStatus != account.AuthStatusActive {
-			t.Fatalf("account %d was not cooled after 403: %#v", credential.ID, observed)
+		if observed.Enabled || !strings.Contains(observed.LastError, "403") {
+			t.Fatalf("account %d was not disabled after 403: %#v", credential.ID, observed)
 		}
 	}
 	logs, total, err := auditRepo.List(ctx, 0, 10)
 	if err != nil || total != 1 || logs[0].StatusCode != http.StatusForbidden || logs[0].ErrorCode != "upstream_forbidden" || logs[0].AccountID == nil || *logs[0].AccountID != credentials[2].ID {
 		t.Fatalf("audit = %#v, total=%d, err=%v", logs, total, err)
+	}
+}
+
+func TestGatewayDisablesWebAccountsAfterChatForbiddenAndRotates(t *testing.T) {
+	ctx := context.Background()
+	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "web-forbidden.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	if err := database.InitializeSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+	accountRepo := relational.NewAccountRepository(database)
+	modelRepo := relational.NewModelRepository(database)
+	auditRepo := relational.NewAuditRepository(database)
+	responseRepo := relational.NewResponseRepository(database)
+	keyRepo := relational.NewClientKeyRepository(database)
+
+	bad, _, err := accountRepo.UpsertByIdentity(ctx, account.Credential{
+		Provider: account.ProviderWeb, Name: "web-bad", SourceKey: "web-bad", EncryptedAccessToken: "sso-bad",
+		AuthType: account.AuthTypeSSO, Enabled: true, AuthStatus: account.AuthStatusActive, Priority: 200, MaxConcurrent: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	good, _, err := accountRepo.UpsertByIdentity(ctx, account.Credential{
+		Provider: account.ProviderWeb, Name: "web-good", SourceKey: "web-good", EncryptedAccessToken: "sso-good",
+		AuthType: account.AuthTypeSSO, Enabled: true, AuthStatus: account.AuthStatusActive, Priority: 100, MaxConcurrent: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	if err := modelRepo.UpsertDiscovered(ctx, account.ProviderWeb, []string{"grok-web-rotate"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, credential := range []account.Credential{bad, good} {
+		if err := modelRepo.ReplaceAccountCapabilities(ctx, credential.ID, []string{"grok-web-rotate"}, now); err != nil {
+			t.Fatal(err)
+		}
+		if err := accountRepo.SaveQuotaWindows(ctx, credential.ID, account.WebTierBasic, now, []account.QuotaWindow{{
+			AccountID: credential.ID, Mode: "fast", Remaining: 10, Total: 10, WindowSeconds: 3600,
+			Source: account.QuotaSourceUpstream, SyncedAt: &now,
+		}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	clientKey, err := keyRepo.Create(ctx, clientkey.Key{
+		Name: "web-key", Prefix: "webkey", SecretHash: strings.Repeat("c", 64), EncryptedSecret: "encrypted",
+		Enabled: true, RPMLimit: 120, MaxConcurrent: 8,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	adapter := &webForbiddenThenOKAdapter{badAccountID: bad.ID}
+	registry := provider.NewRegistry(adapter)
+	sticky := memory.NewStickyStore()
+	accountService := accountapp.NewService(accountRepo, auditRepo, memory.NewDeviceSessionStore(), sticky, registry, testCipher(t), nil)
+	selector := NewSelector(accountRepo, memory.NewConcurrencyLimiter(), sticky, registry, time.Hour, time.Second, time.Minute)
+	service := NewService(modelRepo, auditRepo, accountService, clientkeyapp.NewService(nil, nil, nil, 60, 4, nil), registry, selector, responseRepo, 3)
+
+	result, err := service.CreateResponse(ctx, Input{
+		RequestID: "req-web-403-rotate", ClientKey: clientKey, PublicModel: "grok-web-rotate",
+		Body: []byte(`{"model":"grok-web-rotate","input":"hello"}`),
+	})
+	if err != nil {
+		t.Fatalf("CreateResponse error = %v", err)
+	}
+	if result.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d", result.StatusCode)
+	}
+	_ = result.Body.Close()
+
+	observedBad, err := accountRepo.Get(ctx, bad.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if observedBad.Enabled || !strings.Contains(observedBad.LastError, "403") {
+		t.Fatalf("bad account was not disabled: %#v", observedBad)
+	}
+	observedGood, err := accountRepo.Get(ctx, good.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !observedGood.Enabled {
+		t.Fatalf("good account should remain enabled: %#v", observedGood)
+	}
+	attempts := adapter.Attempts()
+	if len(attempts) != 2 || attempts[0] != bad.ID || attempts[1] != good.ID {
+		t.Fatalf("attempts = %#v want [%d %d]", attempts, bad.ID, good.ID)
 	}
 }
 
@@ -1038,7 +1130,7 @@ func TestBuildChatPermissionDenialDoesNotInvalidateVideoCredential(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if updated.AuthStatus != account.AuthStatusActive || updated.FailureCount != 0 || updated.CooldownUntil != nil {
+	if !updated.Enabled || updated.AuthStatus != account.AuthStatusActive || updated.FailureCount != 0 || updated.CooldownUntil != nil {
 		t.Fatalf("chat denial invalidated the whole credential: %#v", updated)
 	}
 	candidates, err := accountRepo.ListRoutingCandidates(ctx, account.ProviderBuild, "grok-chat-denied", "")
@@ -1669,6 +1761,38 @@ func (a *systemicForbiddenAdapter) ForwardResponse(_ context.Context, request pr
 	}, nil
 }
 func (a *systemicForbiddenAdapter) Attempts() []uint64 {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return append([]uint64(nil), a.attempts...)
+}
+
+type webForbiddenThenOKAdapter struct {
+	mu           sync.Mutex
+	attempts     []uint64
+	badAccountID uint64
+}
+
+func (a *webForbiddenThenOKAdapter) Provider() account.Provider { return account.ProviderWeb }
+func (a *webForbiddenThenOKAdapter) Definition() provider.Definition {
+	return testConversationDefinition(account.ProviderWeb)
+}
+func (a *webForbiddenThenOKAdapter) QuotaMode(string) string { return "fast" }
+func (a *webForbiddenThenOKAdapter) ForwardResponse(_ context.Context, request provider.ResponseResourceRequest) (*provider.Response, error) {
+	a.mu.Lock()
+	a.attempts = append(a.attempts, request.Credential.ID)
+	a.mu.Unlock()
+	if request.Credential.ID == a.badAccountID {
+		return &provider.Response{
+			StatusCode: http.StatusForbidden, Status: "403 Forbidden", Header: make(http.Header),
+			Body: io.NopCloser(strings.NewReader(`{"error":{"message":"Request rejected by anti-bot rules.","code":7}}`)),
+		}, nil
+	}
+	return &provider.Response{
+		StatusCode: http.StatusOK, Status: "200 OK", Header: make(http.Header),
+		Body: io.NopCloser(strings.NewReader(`{"id":"resp-web-ok"}`)),
+	}, nil
+}
+func (a *webForbiddenThenOKAdapter) Attempts() []uint64 {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	return append([]uint64(nil), a.attempts...)

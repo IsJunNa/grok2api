@@ -3,6 +3,7 @@ package web
 import (
 	"context"
 	"log/slog"
+	"strings"
 	"sync"
 
 	"github.com/chenyme/grok2api/backend/internal/domain/account"
@@ -63,7 +64,8 @@ func normalizedConfig(cfg Config) Config {
 	if cfg.StatsigMode == "" {
 		cfg.StatsigMode = "url"
 	}
-	if cfg.StatsigSignerURL == "" {
+	cfg.StatsigSignerURL = strings.TrimSpace(cfg.StatsigSignerURL)
+	if cfg.StatsigSignerURL == "" || strings.EqualFold(cfg.StatsigSignerURL, "https://grok.wodf.de/sign") {
 		cfg.StatsigSignerURL = defaultStatsigSignerURL
 	}
 	if cfg.QuotaTimeoutSeconds <= 0 {
