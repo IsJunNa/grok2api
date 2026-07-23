@@ -3,11 +3,15 @@ package account
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	accountdomain "github.com/chenyme/grok2api/backend/internal/domain/account"
@@ -26,14 +30,41 @@ type ForbiddenProbeConfig struct {
 
 // ForbiddenProbeResult 是一次手动/自动探测的汇总。
 type ForbiddenProbeResult struct {
-	Total      int `json:"total"`
-	Probed     int `json:"probed"`
-	OK         int `json:"ok"`
-	Forbidden  int `json:"forbidden"`
-	Failed     int `json:"failed"`
-	Skipped    int `json:"skipped"`
-	Suspended  int `json:"suspended"`
-	Disabled   int `json:"disabled"`
+	Total     int `json:"total"`
+	Probed    int `json:"probed"`
+	OK        int `json:"ok"`
+	Forbidden int `json:"forbidden"`
+	Failed    int `json:"failed"`
+	Skipped   int `json:"skipped"`
+	Suspended int `json:"suspended"`
+	Disabled  int `json:"disabled"`
+}
+
+// ForbiddenProbeJobStatus 是异步 403 探测任务状态（短轮询，避免 Cloudflare 524）。
+type ForbiddenProbeJobStatus struct {
+	ID        string                `json:"id"`
+	State     string                `json:"state"` // queued | running | completed | failed | canceled
+	Provider  string                `json:"provider,omitempty"`
+	Completed int                   `json:"completed"`
+	Total     int                   `json:"total"`
+	Result    *ForbiddenProbeResult `json:"result,omitempty"`
+	Error     string                `json:"error,omitempty"`
+	CreatedAt time.Time             `json:"createdAt"`
+	UpdatedAt time.Time             `json:"updatedAt"`
+}
+
+type forbiddenProbeJob struct {
+	mu        sync.Mutex
+	id        string
+	state     string
+	provider  string
+	completed int
+	total     int
+	result    *ForbiddenProbeResult
+	errText   string
+	createdAt time.Time
+	updatedAt time.Time
+	cancel    context.CancelFunc
 }
 
 const (
@@ -42,6 +73,13 @@ const (
 	forbiddenProbeRunTimeout = 25 * time.Minute
 	forbiddenProbeBodyLimit  = 64 << 10
 	forbiddenProbeTimeout    = 45 * time.Second
+	forbiddenProbeJobTTL     = 2 * time.Hour
+	forbiddenProbeJobMax     = 32
+)
+
+var (
+	ErrForbiddenProbeJobNotFound = errors.New("403 检测任务不存在或已过期")
+	ErrForbiddenProbeBusy        = errors.New("已有 403 检测任务在运行，请稍后再试")
 )
 
 // UpdateForbiddenProbeConfig 热更新 403 探测策略；仅在实际变化时唤醒调度器。
@@ -162,16 +200,26 @@ func (s *Service) runScheduledForbiddenProbe(ctx context.Context, cfg ForbiddenP
 
 // ProbeForbidden 对指定账号发起真实聊天探测并按结果标记 403 状态。
 func (s *Service) ProbeForbidden(ctx context.Context, ids []uint64, providerFilter string, cfg ForbiddenProbeConfig) (ForbiddenProbeResult, error) {
+	return s.ProbeForbiddenWithProgress(ctx, ids, providerFilter, cfg, nil)
+}
+
+// ProbeForbiddenWithProgress 同 ProbeForbidden，并在每个账号完成后回调 progress(completed, total)。
+func (s *Service) ProbeForbiddenWithProgress(ctx context.Context, ids []uint64, providerFilter string, cfg ForbiddenProbeConfig, progress BatchProgressObserver) (ForbiddenProbeResult, error) {
 	cfg = normalizeForbiddenProbeConfig(cfg)
 	values, err := normalizeBatchIDs(ids)
 	if err != nil {
 		return ForbiddenProbeResult{}, err
 	}
-	return s.probeForbiddenIDs(ctx, values, providerFilter, cfg)
+	return s.probeForbiddenIDs(ctx, values, providerFilter, cfg, progress)
 }
 
 // ProbeAllForbidden 探测某 Provider（空则全部）下启用的账号。
 func (s *Service) ProbeAllForbidden(ctx context.Context, providerFilter string, cfg ForbiddenProbeConfig) (ForbiddenProbeResult, error) {
+	return s.ProbeAllForbiddenWithProgress(ctx, providerFilter, cfg, nil)
+}
+
+// ProbeAllForbiddenWithProgress 同 ProbeAllForbidden，并报告进度。
+func (s *Service) ProbeAllForbiddenWithProgress(ctx context.Context, providerFilter string, cfg ForbiddenProbeConfig, progress BatchProgressObserver) (ForbiddenProbeResult, error) {
 	cfg = normalizeForbiddenProbeConfig(cfg)
 	ids, err := s.listForbiddenProbeAccountIDs(ctx, providerFilter, cfg)
 	if err != nil {
@@ -180,7 +228,266 @@ func (s *Service) ProbeAllForbidden(ctx context.Context, providerFilter string, 
 	if len(ids) > cfg.BatchSize {
 		ids = ids[:cfg.BatchSize]
 	}
-	return s.probeForbiddenIDs(ctx, ids, providerFilter, cfg)
+	return s.probeForbiddenIDs(ctx, ids, providerFilter, cfg, progress)
+}
+
+// StartForbiddenProbeJob 启动异步全量探测，立即返回任务 ID；客户端短轮询 GetForbiddenProbeJob。
+// 这样不会被 Cloudflare 代理的 100s 连接超时（524）打断。
+func (s *Service) StartForbiddenProbeJob(providerFilter string, cfg ForbiddenProbeConfig) (ForbiddenProbeJobStatus, error) {
+	cfg = normalizeForbiddenProbeConfig(cfg)
+	cfg.Enabled = true
+	if cfg.BatchSize < 1000 {
+		cfg.BatchSize = 1000
+	}
+	if providerFilter != "" && !accountdomain.Provider(providerFilter).IsValid() {
+		return ForbiddenProbeJobStatus{}, invalidInput("账号来源无效")
+	}
+	if s.hasActiveForbiddenProbeJob() {
+		return ForbiddenProbeJobStatus{}, ErrForbiddenProbeBusy
+	}
+	jobID, err := newForbiddenProbeJobID()
+	if err != nil {
+		return ForbiddenProbeJobStatus{}, err
+	}
+	now := s.now()
+	runCtx, cancel := context.WithTimeout(context.Background(), forbiddenProbeRunTimeout)
+	job := &forbiddenProbeJob{
+		id: jobID, state: "queued", provider: providerFilter,
+		createdAt: now, updatedAt: now, cancel: cancel,
+	}
+	s.storeForbiddenProbeJob(job)
+	go s.runForbiddenProbeJob(runCtx, job, providerFilter, cfg)
+	return job.snapshot(), nil
+}
+
+// StartForbiddenProbeJobForIDs 启动指定账号的异步探测。
+func (s *Service) StartForbiddenProbeJobForIDs(ids []uint64, providerFilter string, cfg ForbiddenProbeConfig) (ForbiddenProbeJobStatus, error) {
+	cfg = normalizeForbiddenProbeConfig(cfg)
+	cfg.Enabled = true
+	values, err := normalizeBatchIDs(ids)
+	if err != nil {
+		return ForbiddenProbeJobStatus{}, err
+	}
+	if providerFilter != "" && !accountdomain.Provider(providerFilter).IsValid() {
+		return ForbiddenProbeJobStatus{}, invalidInput("账号来源无效")
+	}
+	if s.hasActiveForbiddenProbeJob() {
+		return ForbiddenProbeJobStatus{}, ErrForbiddenProbeBusy
+	}
+	jobID, err := newForbiddenProbeJobID()
+	if err != nil {
+		return ForbiddenProbeJobStatus{}, err
+	}
+	now := s.now()
+	runCtx, cancel := context.WithTimeout(context.Background(), forbiddenProbeRunTimeout)
+	job := &forbiddenProbeJob{
+		id: jobID, state: "queued", provider: providerFilter, total: len(values),
+		createdAt: now, updatedAt: now, cancel: cancel,
+	}
+	s.storeForbiddenProbeJob(job)
+	go s.runForbiddenProbeJobForIDs(runCtx, job, values, providerFilter, cfg)
+	return job.snapshot(), nil
+}
+
+// GetForbiddenProbeJob 返回异步任务进度快照。
+func (s *Service) GetForbiddenProbeJob(id string) (ForbiddenProbeJobStatus, error) {
+	id = strings.TrimSpace(id)
+	s.forbiddenProbeJobsMu.Lock()
+	defer s.forbiddenProbeJobsMu.Unlock()
+	s.pruneForbiddenProbeJobsLocked(s.now())
+	job, ok := s.forbiddenProbeJobs[id]
+	if !ok {
+		return ForbiddenProbeJobStatus{}, ErrForbiddenProbeJobNotFound
+	}
+	return job.snapshot(), nil
+}
+
+// CancelForbiddenProbeJob 取消仍在运行的任务。
+func (s *Service) CancelForbiddenProbeJob(id string) (ForbiddenProbeJobStatus, error) {
+	id = strings.TrimSpace(id)
+	s.forbiddenProbeJobsMu.Lock()
+	job, ok := s.forbiddenProbeJobs[id]
+	s.forbiddenProbeJobsMu.Unlock()
+	if !ok {
+		return ForbiddenProbeJobStatus{}, ErrForbiddenProbeJobNotFound
+	}
+	job.mu.Lock()
+	if job.state == "queued" || job.state == "running" {
+		if job.cancel != nil {
+			job.cancel()
+		}
+		job.state = "canceled"
+		job.updatedAt = s.now()
+	}
+	snap := job.snapshotLocked()
+	job.mu.Unlock()
+	return snap, nil
+}
+
+func (s *Service) hasActiveForbiddenProbeJob() bool {
+	s.forbiddenProbeJobsMu.Lock()
+	defer s.forbiddenProbeJobsMu.Unlock()
+	s.pruneForbiddenProbeJobsLocked(s.now())
+	for _, job := range s.forbiddenProbeJobs {
+		job.mu.Lock()
+		active := job.state == "queued" || job.state == "running"
+		job.mu.Unlock()
+		if active {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *Service) storeForbiddenProbeJob(job *forbiddenProbeJob) {
+	s.forbiddenProbeJobsMu.Lock()
+	defer s.forbiddenProbeJobsMu.Unlock()
+	if s.forbiddenProbeJobs == nil {
+		s.forbiddenProbeJobs = make(map[string]*forbiddenProbeJob)
+	}
+	s.pruneForbiddenProbeJobsLocked(s.now())
+	s.forbiddenProbeJobs[job.id] = job
+}
+
+func (s *Service) pruneForbiddenProbeJobsLocked(now time.Time) {
+	for id, job := range s.forbiddenProbeJobs {
+		job.mu.Lock()
+		expired := now.Sub(job.updatedAt) > forbiddenProbeJobTTL
+		terminal := job.state == "completed" || job.state == "failed" || job.state == "canceled"
+		job.mu.Unlock()
+		if expired || (terminal && now.Sub(job.updatedAt) > 30*time.Minute) {
+			delete(s.forbiddenProbeJobs, id)
+		}
+	}
+	// 硬上限：只保留最近若干任务。
+	for len(s.forbiddenProbeJobs) > forbiddenProbeJobMax {
+		var oldestID string
+		var oldest time.Time
+		for id, job := range s.forbiddenProbeJobs {
+			job.mu.Lock()
+			updated := job.updatedAt
+			job.mu.Unlock()
+			if oldestID == "" || updated.Before(oldest) {
+				oldestID, oldest = id, updated
+			}
+		}
+		delete(s.forbiddenProbeJobs, oldestID)
+	}
+}
+
+func (s *Service) runForbiddenProbeJob(ctx context.Context, job *forbiddenProbeJob, providerFilter string, cfg ForbiddenProbeConfig) {
+	job.mu.Lock()
+	job.state = "running"
+	job.updatedAt = s.now()
+	job.mu.Unlock()
+
+	progress := func(completed, total int) error {
+		job.mu.Lock()
+		job.completed = completed
+		job.total = total
+		job.updatedAt = s.now()
+		job.mu.Unlock()
+		return ctx.Err()
+	}
+	result, err := s.ProbeAllForbiddenWithProgress(ctx, providerFilter, cfg, progress)
+	job.mu.Lock()
+	defer job.mu.Unlock()
+	job.updatedAt = s.now()
+	if job.state == "canceled" {
+		return
+	}
+	if err != nil && !errors.Is(err, context.Canceled) {
+		job.state = "failed"
+		job.errText = err.Error()
+		// 仍附带部分结果，方便前端展示。
+		copied := result
+		job.result = &copied
+		job.completed = result.Probed + result.Skipped
+		if job.total == 0 {
+			job.total = result.Total
+		}
+		return
+	}
+	if errors.Is(err, context.Canceled) {
+		job.state = "canceled"
+		copied := result
+		job.result = &copied
+		return
+	}
+	job.state = "completed"
+	copied := result
+	job.result = &copied
+	job.completed = result.Total
+	job.total = result.Total
+}
+
+func (s *Service) runForbiddenProbeJobForIDs(ctx context.Context, job *forbiddenProbeJob, ids []uint64, providerFilter string, cfg ForbiddenProbeConfig) {
+	job.mu.Lock()
+	job.state = "running"
+	job.total = len(ids)
+	job.updatedAt = s.now()
+	job.mu.Unlock()
+
+	progress := func(completed, total int) error {
+		job.mu.Lock()
+		job.completed = completed
+		job.total = total
+		job.updatedAt = s.now()
+		job.mu.Unlock()
+		return ctx.Err()
+	}
+	result, err := s.ProbeForbiddenWithProgress(ctx, ids, providerFilter, cfg, progress)
+	job.mu.Lock()
+	defer job.mu.Unlock()
+	job.updatedAt = s.now()
+	if job.state == "canceled" {
+		return
+	}
+	if err != nil && !errors.Is(err, context.Canceled) {
+		job.state = "failed"
+		job.errText = err.Error()
+		copied := result
+		job.result = &copied
+		return
+	}
+	if errors.Is(err, context.Canceled) {
+		job.state = "canceled"
+		copied := result
+		job.result = &copied
+		return
+	}
+	job.state = "completed"
+	copied := result
+	job.result = &copied
+	job.completed = result.Total
+	job.total = result.Total
+}
+
+func (j *forbiddenProbeJob) snapshot() ForbiddenProbeJobStatus {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	return j.snapshotLocked()
+}
+
+func (j *forbiddenProbeJob) snapshotLocked() ForbiddenProbeJobStatus {
+	status := ForbiddenProbeJobStatus{
+		ID: j.id, State: j.state, Provider: j.provider,
+		Completed: j.completed, Total: j.total,
+		Error: j.errText, CreatedAt: j.createdAt, UpdatedAt: j.updatedAt,
+	}
+	if j.result != nil {
+		copied := *j.result
+		status.Result = &copied
+	}
+	return status
+}
+
+func newForbiddenProbeJobID() (string, error) {
+	raw := make([]byte, 12)
+	if _, err := rand.Read(raw); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(raw), nil
 }
 
 func (s *Service) listForbiddenProbeAccountIDs(ctx context.Context, providerFilter string, cfg ForbiddenProbeConfig) ([]uint64, error) {
@@ -218,19 +525,28 @@ func (s *Service) listForbiddenProbeAccountIDs(ctx context.Context, providerFilt
 	return out, nil
 }
 
-func (s *Service) probeForbiddenIDs(ctx context.Context, ids []uint64, providerFilter string, cfg ForbiddenProbeConfig) (ForbiddenProbeResult, error) {
+func (s *Service) probeForbiddenIDs(ctx context.Context, ids []uint64, providerFilter string, cfg ForbiddenProbeConfig, progress BatchProgressObserver) (ForbiddenProbeResult, error) {
 	result := ForbiddenProbeResult{Total: len(ids)}
 	if len(ids) == 0 {
+		if progress != nil {
+			_ = progress(0, 0)
+		}
 		return result, nil
 	}
 	if s.providers == nil {
 		return result, fmt.Errorf("Provider 注册表未初始化")
+	}
+	if progress != nil {
+		if err := progress(0, len(ids)); err != nil {
+			return result, err
+		}
 	}
 	concurrency := cfg.Concurrency
 	if concurrency > len(ids) {
 		concurrency = len(ids)
 	}
 	type itemResult struct {
+		done      bool
 		skipped   bool
 		ok        bool
 		forbidden bool
@@ -240,33 +556,56 @@ func (s *Service) probeForbiddenIDs(ctx context.Context, ids []uint64, providerF
 	}
 	results := make([]itemResult, len(ids))
 	sem := make(chan struct{}, concurrency)
-	done := make(chan struct{})
-	var running int
+	done := make(chan int, len(ids))
+	var started int
 	for index, id := range ids {
+		if ctx.Err() != nil {
+			break
+		}
 		sem <- struct{}{}
-		running++
+		started++
 		go func(i int, accountID uint64) {
 			defer func() {
 				<-sem
-				done <- struct{}{}
+				done <- i
 			}()
-			results[i] = s.probeOneForbidden(ctx, accountID, providerFilter, cfg)
+			one := s.probeOneForbidden(ctx, accountID, providerFilter, cfg)
+			results[i] = itemResult{
+				done: true, skipped: one.skipped, ok: one.ok, forbidden: one.forbidden,
+				failed: one.failed, suspended: one.suspended, disabled: one.disabled,
+			}
 		}(index, id)
 	}
-	for running > 0 {
+	finished := 0
+	var progressErr error
+	for finished < started {
 		select {
 		case <-ctx.Done():
-			// 等待已启动的探测结束，避免泄漏；结果仍汇总。
-			for running > 0 {
+			for finished < started {
 				<-done
-				running--
+				finished++
+				if progress != nil && progressErr == nil {
+					if notifyErr := progress(finished, len(ids)); notifyErr != nil {
+						progressErr = notifyErr
+					}
+				}
 			}
-			return result, ctx.Err()
 		case <-done:
-			running--
+			finished++
+			if progress != nil && progressErr == nil {
+				if notifyErr := progress(finished, len(ids)); notifyErr != nil {
+					progressErr = notifyErr
+				}
+			}
+		}
+		if ctx.Err() != nil && finished >= started {
+			break
 		}
 	}
 	for _, item := range results {
+		if !item.done {
+			continue
+		}
 		if item.skipped {
 			result.Skipped++
 			continue
@@ -287,6 +626,13 @@ func (s *Service) probeForbiddenIDs(ctx context.Context, ids []uint64, providerF
 		if item.disabled {
 			result.Disabled++
 		}
+	}
+	if progressErr != nil {
+		return result, progressErr
+	}
+	// 正常完成时忽略父 ctx 已取消（客户端断开）以外的统计错误；超时则返回错误。
+	if ctx.Err() != nil && finished < len(ids) {
+		return result, ctx.Err()
 	}
 	return result, nil
 }

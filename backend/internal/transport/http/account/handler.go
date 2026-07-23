@@ -154,7 +154,10 @@ func (h *Handler) Register(router *gin.RouterGroup) {
 	router.POST("/accounts/batch/refresh-quotas", h.batchRefreshQuotas)
 	router.POST("/accounts/batch/refresh-tokens", h.batchRefreshTokens)
 	router.POST("/accounts/batch/probe-forbidden", h.batchProbeForbidden)
+	router.POST("/accounts/batch/mark-forbidden", h.batchMarkForbidden)
 	router.POST("/accounts/probe-forbidden", h.probeAllForbidden)
+	router.GET("/accounts/probe-forbidden/jobs/:jobId", h.getForbiddenProbeJob)
+	router.POST("/accounts/probe-forbidden/jobs/:jobId/cancel", h.cancelForbiddenProbeJob)
 	router.PATCH("/accounts/batch", h.batchUpdate)
 	router.DELETE("/accounts", h.batchDelete)
 	router.PATCH("/accounts/:id", h.update)
@@ -551,6 +554,37 @@ func (h *Handler) batchRefreshTokens(c *gin.Context) {
 	response.Success(c, http.StatusOK, gin.H{"succeeded": succeeded, "failed": failed, "skipped": skipped})
 }
 
+func (h *Handler) batchMarkForbidden(c *gin.Context) {
+	var request struct {
+		IDs      []string `json:"ids"`
+		Provider string   `json:"provider"`
+		Detail   string   `json:"detail"`
+	}
+	if c.ShouldBindJSON(&request) != nil {
+		response.Error(c, http.StatusBadRequest, "invalidRequest", "请求参数无效")
+		return
+	}
+	ids, err := parseIDs(request.IDs)
+	if err != nil {
+		response.Error(c, http.StatusBadRequest, "invalidId", err.Error())
+		return
+	}
+	providerValue := accountdomain.Provider(request.Provider)
+	if !providerValue.IsValid() {
+		response.Error(c, http.StatusBadRequest, "invalidProvider", "账号来源无效")
+		return
+	}
+	if !h.validateProviderIDs(c, ids, request.Provider) {
+		return
+	}
+	result, err := h.service.MarkAccountsForbidden(c.Request.Context(), ids, request.Detail)
+	if err != nil {
+		h.writeServiceError(c, "forbiddenMarkFailed", err, http.StatusBadGateway, "403 标记失败")
+		return
+	}
+	response.Success(c, http.StatusOK, result)
+}
+
 func (h *Handler) batchProbeForbidden(c *gin.Context) {
 	var request batchDeleteRequest
 	if c.ShouldBindJSON(&request) != nil {
@@ -570,12 +604,17 @@ func (h *Handler) batchProbeForbidden(c *gin.Context) {
 	if !h.validateProviderIDs(c, ids, request.Provider) {
 		return
 	}
-	result, err := h.service.ProbeForbidden(c.Request.Context(), ids, request.Provider, h.forbiddenProbeConfig())
+	// 异步任务 + 短轮询，避免 Cloudflare 代理 100s 超时返回 524。
+	job, err := h.service.StartForbiddenProbeJobForIDs(ids, request.Provider, h.forbiddenProbeConfig())
 	if err != nil {
-		h.writeServiceError(c, "forbiddenProbeFailed", err, http.StatusBadGateway, "403 检测失败")
+		if errors.Is(err, accountapp.ErrForbiddenProbeBusy) {
+			response.Error(c, http.StatusConflict, "forbiddenProbeBusy", "已有 403 检测任务在运行")
+			return
+		}
+		h.writeServiceError(c, "forbiddenProbeFailed", err, http.StatusBadGateway, "403 检测启动失败")
 		return
 	}
-	response.Success(c, http.StatusOK, result)
+	response.Success(c, http.StatusAccepted, job)
 }
 
 func (h *Handler) probeAllForbidden(c *gin.Context) {
@@ -590,12 +629,52 @@ func (h *Handler) probeAllForbidden(c *gin.Context) {
 		response.Error(c, http.StatusBadRequest, "invalidProvider", "账号来源无效")
 		return
 	}
-	result, err := h.service.ProbeAllForbidden(c.Request.Context(), request.Provider, h.forbiddenProbeConfig())
+	job, err := h.service.StartForbiddenProbeJob(request.Provider, h.forbiddenProbeConfig())
 	if err != nil {
-		h.writeServiceError(c, "forbiddenProbeFailed", err, http.StatusBadGateway, "403 检测失败")
+		if errors.Is(err, accountapp.ErrForbiddenProbeBusy) {
+			response.Error(c, http.StatusConflict, "forbiddenProbeBusy", "已有 403 检测任务在运行")
+			return
+		}
+		h.writeServiceError(c, "forbiddenProbeFailed", err, http.StatusBadGateway, "403 检测启动失败")
 		return
 	}
-	response.Success(c, http.StatusOK, result)
+	response.Success(c, http.StatusAccepted, job)
+}
+
+func (h *Handler) getForbiddenProbeJob(c *gin.Context) {
+	jobID := strings.TrimSpace(c.Param("jobId"))
+	if jobID == "" {
+		response.Error(c, http.StatusBadRequest, "invalidId", "任务 ID 无效")
+		return
+	}
+	job, err := h.service.GetForbiddenProbeJob(jobID)
+	if err != nil {
+		if errors.Is(err, accountapp.ErrForbiddenProbeJobNotFound) {
+			response.Error(c, http.StatusNotFound, "forbiddenProbeJobNotFound", "403 检测任务不存在或已过期")
+			return
+		}
+		h.writeServiceError(c, "forbiddenProbeFailed", err, http.StatusInternalServerError, "读取 403 检测任务失败")
+		return
+	}
+	response.Success(c, http.StatusOK, job)
+}
+
+func (h *Handler) cancelForbiddenProbeJob(c *gin.Context) {
+	jobID := strings.TrimSpace(c.Param("jobId"))
+	if jobID == "" {
+		response.Error(c, http.StatusBadRequest, "invalidId", "任务 ID 无效")
+		return
+	}
+	job, err := h.service.CancelForbiddenProbeJob(jobID)
+	if err != nil {
+		if errors.Is(err, accountapp.ErrForbiddenProbeJobNotFound) {
+			response.Error(c, http.StatusNotFound, "forbiddenProbeJobNotFound", "403 检测任务不存在或已过期")
+			return
+		}
+		h.writeServiceError(c, "forbiddenProbeFailed", err, http.StatusInternalServerError, "取消 403 检测任务失败")
+		return
+	}
+	response.Success(c, http.StatusOK, job)
 }
 
 func (h *Handler) forbiddenProbeConfig() accountapp.ForbiddenProbeConfig {

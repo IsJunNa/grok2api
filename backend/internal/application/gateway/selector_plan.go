@@ -15,10 +15,12 @@ type candidateScore struct {
 	index           int
 	tier            int
 	preferFreeBuild bool
-	billingFresh    bool
-	inFlight        int
-	remaining       float64
-	lastSelected    time.Time
+	// botFlagged 为 true 时表示 Build JWT 带 bot_flag_source=1，排序时劣于 clean 号。
+	botFlagged   bool
+	billingFresh bool
+	inFlight     int
+	remaining    float64
+	lastSelected time.Time
 }
 
 // candidatePlan 使用线性建堆保留完整路由优先级，并允许 claim 失败后按顺序取下一账号。
@@ -67,6 +69,10 @@ func candidateScoreBetter(values []account.RoutingCandidate, leftScore, rightSco
 	}
 	if leftScore.preferFreeBuild != rightScore.preferFreeBuild {
 		return leftScore.preferFreeBuild
+	}
+	// 同优先级下优先 clean 号，降低注册机 bot_flag 被抽中的概率。
+	if leftScore.botFlagged != rightScore.botFlagged {
+		return !leftScore.botFlagged
 	}
 	if leftScore.tier != rightScore.tier {
 		return leftScore.tier < rightScore.tier
@@ -165,6 +171,7 @@ func (s *Selector) planCandidateIndexesWithHints(ctx context.Context, values []a
 		score := candidateScore{
 			index: index, tier: tierOrderRank(tierOrder, candidate.Credential.WebTier),
 			preferFreeBuild: preferFreeBuild && candidate.IsKnownFreeBuild(),
+			botFlagged:      s.isBuildBotFlagged(candidate.Credential),
 			inFlight:        inFlight[position], lastSelected: s.lastSelectedAt[candidate.Credential.ID],
 		}
 		if candidate.Billing != nil {

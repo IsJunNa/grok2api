@@ -186,7 +186,9 @@ type Selector struct {
 	overlayProviderVersion map[account.Provider]uint64
 	candidateLoads         singleflight.Group
 	concurrencySnapshots   *resultcache.Cache[[32]byte, map[string]int]
-	tierOrders             interface {
+	// buildBotFlagged 可选：Build 账号 JWT bot_flag_source=1 时返回 true，选号时降权。
+	buildBotFlagged func(account.Credential) bool
+	tierOrders      interface {
 		TierOrder(account.Provider, string) []account.WebTier
 	}
 }
@@ -217,6 +219,26 @@ func (s *Selector) UpdatePreferFreeBuild(value bool) {
 	s.configMu.Lock()
 	s.preferFreeBuild = value
 	s.configMu.Unlock()
+}
+
+// SetBuildBotFlagChecker 设置 Build bot_flag 探测函数；nil 表示不按风控降权。
+func (s *Selector) SetBuildBotFlagChecker(check func(account.Credential) bool) {
+	s.configMu.Lock()
+	s.buildBotFlagged = check
+	s.configMu.Unlock()
+}
+
+func (s *Selector) isBuildBotFlagged(credential account.Credential) bool {
+	if credential.Provider != account.ProviderBuild {
+		return false
+	}
+	s.configMu.RLock()
+	check := s.buildBotFlagged
+	s.configMu.RUnlock()
+	if check == nil {
+		return false
+	}
+	return check(credential)
 }
 
 // UpdateSegmentedSelector changes the large-pool bounded planner policy.

@@ -24,6 +24,7 @@ type segmentedSelectorCohort struct {
 	supportsModel   bool
 	capabilityKnown bool
 	preferFreeBuild bool
+	botFlagged      bool
 	tier            int
 	priority        int
 	billingFresh    bool
@@ -97,6 +98,9 @@ func segmentedSelectorCohortBetter(left, right segmentedSelectorCohort) bool {
 	}
 	if left.preferFreeBuild != right.preferFreeBuild {
 		return left.preferFreeBuild
+	}
+	if left.botFlagged != right.botFlagged {
+		return !left.botFlagged
 	}
 	if left.tier != right.tier {
 		return left.tier < right.tier

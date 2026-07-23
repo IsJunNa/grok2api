@@ -145,6 +145,8 @@ export function AccountsPage() {
   const [renewalProgress, setRenewalProgress] = useState<AccountTaskProgressDTO | null>(null);
   const [forbiddenProbeOpen, setForbiddenProbeOpen] = useState(false);
   const [forbiddenProbeBatchOpen, setForbiddenProbeBatchOpen] = useState(false);
+  const [forbiddenProbeProgress, setForbiddenProbeProgress] = useState<AccountTaskProgressDTO | null>(null);
+  const forbiddenProbeAbortRef = useRef<AbortController | null>(null);
   const [editing, setEditing] = useState<AccountDTO | null>(null);
   const [deleting, setDeleting] = useState<AccountDTO | null>(null);
   const [deviceOpen, setDeviceOpen] = useState(false);
@@ -493,24 +495,46 @@ export function AccountsPage() {
   });
 
   const forbiddenProbeMutation = useMutation({
-    mutationFn: () => probeAllAccountsForbidden(provider),
+    mutationFn: () => {
+      forbiddenProbeAbortRef.current?.abort();
+      const controller = new AbortController();
+      forbiddenProbeAbortRef.current = controller;
+      setForbiddenProbeProgress({ completed: 0, total: 0 });
+      return probeAllAccountsForbidden(provider, setForbiddenProbeProgress, controller.signal);
+    },
     onSuccess: (result) => {
       setForbiddenProbeOpen(false);
+      setForbiddenProbeProgress(null);
       invalidateAccountData();
       toast.success(t("accounts.forbiddenProbeCompleted", result));
     },
-    onError: showError,
+    onError: (error) => {
+      setForbiddenProbeProgress(null);
+      if (isAbortError(error)) return;
+      showError(error);
+    },
   });
 
   const forbiddenProbeBatchMutation = useMutation({
-    mutationFn: () => probeAccountsForbidden([...selected], provider),
+    mutationFn: () => {
+      forbiddenProbeAbortRef.current?.abort();
+      const controller = new AbortController();
+      forbiddenProbeAbortRef.current = controller;
+      setForbiddenProbeProgress({ completed: 0, total: selected.size });
+      return probeAccountsForbidden([...selected], provider, setForbiddenProbeProgress, controller.signal);
+    },
     onSuccess: (result) => {
       clearSelection();
       setForbiddenProbeBatchOpen(false);
+      setForbiddenProbeProgress(null);
       invalidateAccountData();
       toast.success(t("accounts.forbiddenProbeCompleted", result));
     },
-    onError: showError,
+    onError: (error) => {
+      setForbiddenProbeProgress(null);
+      if (isAbortError(error)) return;
+      showError(error);
+    },
   });
 
   const bindEgressMutation = useMutation({
@@ -1020,7 +1044,13 @@ export function AccountsPage() {
         />
       ) : null}
 
-      <AlertDialog open={forbiddenProbeOpen} onOpenChange={setForbiddenProbeOpen}>
+      <AlertDialog open={forbiddenProbeOpen} onOpenChange={(open) => {
+        if (!open) {
+          forbiddenProbeAbortRef.current?.abort();
+          setForbiddenProbeProgress(null);
+        }
+        setForbiddenProbeOpen(open);
+      }}>
         <AlertDialogContent>
           <AlertDialogHeader>
             <AlertDialogTitle>{t("accounts.forbiddenProbeTitle")}</AlertDialogTitle>
@@ -1029,13 +1059,21 @@ export function AccountsPage() {
           <AlertDialogFooter>
             <AlertDialogCancel>{t("common.cancel")}</AlertDialogCancel>
             <AlertDialogAction disabled={forbiddenProbeMutation.isPending} onClick={(event) => { event.preventDefault(); forbiddenProbeMutation.mutate(); }}>
-              {forbiddenProbeMutation.isPending ? <><Spinner />{t("common.loading")}</> : t("accounts.forbiddenProbeStart")}
+              {forbiddenProbeMutation.isPending
+                ? <><Spinner /><span className="tabular-nums">{forbiddenProbeProgress && forbiddenProbeProgress.total > 0 ? `${forbiddenProbeProgress.completed} / ${forbiddenProbeProgress.total}` : t("common.loading")}</span></>
+                : t("accounts.forbiddenProbeStart")}
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>
 
-      <AlertDialog open={forbiddenProbeBatchOpen} onOpenChange={setForbiddenProbeBatchOpen}>
+      <AlertDialog open={forbiddenProbeBatchOpen} onOpenChange={(open) => {
+        if (!open) {
+          forbiddenProbeAbortRef.current?.abort();
+          setForbiddenProbeProgress(null);
+        }
+        setForbiddenProbeBatchOpen(open);
+      }}>
         <AlertDialogContent>
           <AlertDialogHeader>
             <AlertDialogTitle>{t("accounts.forbiddenProbeBatchTitle", { count: selected.size })}</AlertDialogTitle>
@@ -1044,7 +1082,9 @@ export function AccountsPage() {
           <AlertDialogFooter>
             <AlertDialogCancel>{t("common.cancel")}</AlertDialogCancel>
             <AlertDialogAction disabled={forbiddenProbeBatchMutation.isPending} onClick={(event) => { event.preventDefault(); forbiddenProbeBatchMutation.mutate(); }}>
-              {forbiddenProbeBatchMutation.isPending ? <><Spinner />{t("common.loading")}</> : t("accounts.forbiddenProbeStart")}
+              {forbiddenProbeBatchMutation.isPending
+                ? <><Spinner /><span className="tabular-nums">{forbiddenProbeProgress && forbiddenProbeProgress.total > 0 ? `${forbiddenProbeProgress.completed} / ${forbiddenProbeProgress.total}` : t("common.loading")}</span></>
+                : t("accounts.forbiddenProbeStart")}
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>

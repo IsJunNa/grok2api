@@ -1,5 +1,5 @@
 import { ApiError, apiDownload, apiEventStream, apiRequest, type PaginatedDTO } from "@/shared/api/client";
-import { createObjectDecoder, createPaginatedDecoder, createValidatedDecoder, decodeBooleanResult, decodeCountResult, hasShape, isArrayOf, isBoolean, isNumber, isOneOf, isOptional, isRecordOf, isString } from "@/shared/api/decoder";
+import { createObjectDecoder, createPaginatedDecoder, createValidatedDecoder, decodeBooleanResult, decodeCountResult, hasShape, isArrayOf, isBoolean, isNumber, isOneOf, isOptional, isRecordOf, isString, type ValueValidator } from "@/shared/api/decoder";
 import { i18n } from "@/shared/i18n";
 import type { SortOrder } from "@/shared/lib/table-sort";
 
@@ -320,7 +320,152 @@ export type AccountImportResultDTO = {
 
 export type WebConsoleSyncResultDTO = AccountImportResultDTO & { skipped: number };
 
-type AccountTaskStreamPayload = Partial<BuildConversionResultDTO & AccountTaskProgressDTO & AccountTokenRefreshResultDTO & AccountImportResultDTO> & {
+export type ForbiddenProbeResultDTO = {
+  total: number;
+  probed: number;
+  ok: number;
+  forbidden: number;
+  failed: number;
+  skipped: number;
+  suspended: number;
+  disabled: number;
+};
+
+export type ForbiddenProbeJobState = "queued" | "running" | "completed" | "failed" | "canceled";
+
+export type ForbiddenProbeJobDTO = {
+  id: string;
+  state: ForbiddenProbeJobState;
+  provider?: string;
+  completed: number;
+  total: number;
+  result?: ForbiddenProbeResultDTO;
+  error?: string;
+  createdAt: string;
+  updatedAt: string;
+};
+
+const decodeForbiddenProbeResult = createObjectDecoder<ForbiddenProbeResultDTO>("forbidden probe result", {
+  total: isNumber,
+  probed: isNumber,
+  ok: isNumber,
+  forbidden: isNumber,
+  failed: isNumber,
+  skipped: isNumber,
+  suspended: isNumber,
+  disabled: isNumber,
+});
+
+const isForbiddenProbeResult: ValueValidator = (value) => {
+  try {
+    decodeForbiddenProbeResult(value);
+    return true;
+  } catch {
+    return false;
+  }
+};
+
+const decodeForbiddenProbeJob = createObjectDecoder<ForbiddenProbeJobDTO>("forbidden probe job", {
+  id: isString,
+  state: isOneOf("queued", "running", "completed", "failed", "canceled"),
+  provider: isOptional(isString),
+  completed: isNumber,
+  total: isNumber,
+  result: isOptional(isForbiddenProbeResult),
+  error: isOptional(isString),
+  createdAt: isString,
+  updatedAt: isString,
+});
+
+const forbiddenProbePollIntervalMs = 1_000;
+
+async function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted) {
+    throw new DOMException("Aborted", "AbortError");
+  }
+  await new Promise<void>((resolve, reject) => {
+    const timer = window.setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    const onAbort = () => {
+      window.clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
+      reject(new DOMException("Aborted", "AbortError"));
+    };
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+async function cancelForbiddenProbeJob(jobId: string): Promise<void> {
+  try {
+    await apiRequest(`/api/admin/v1/accounts/probe-forbidden/jobs/${encodeURIComponent(jobId)}/cancel`, { method: "POST" }, decodeForbiddenProbeJob);
+  } catch {
+    // 关闭对话框或页面卸载时取消失败可忽略。
+  }
+}
+
+async function pollForbiddenProbeJob(
+  jobId: string,
+  onProgress?: (value: AccountTaskProgressDTO) => void,
+  signal?: AbortSignal,
+): Promise<ForbiddenProbeResultDTO> {
+  for (;;) {
+    if (signal?.aborted) {
+      await cancelForbiddenProbeJob(jobId);
+      throw new DOMException("Aborted", "AbortError");
+    }
+    const job = await apiRequest(
+      `/api/admin/v1/accounts/probe-forbidden/jobs/${encodeURIComponent(jobId)}`,
+      { method: "GET", signal },
+      decodeForbiddenProbeJob,
+    );
+    onProgress?.({ completed: job.completed, total: job.total });
+    if (job.state === "completed") {
+      if (!job.result) {
+        throw new ApiError(502, "invalidResponse", i18n.t("apiErrors.invalidResponse"));
+      }
+      return job.result;
+    }
+    if (job.state === "failed") {
+      const code = "forbiddenProbeFailed";
+      throw new ApiError(502, code, i18n.exists(`apiErrors.${code}`) ? i18n.t(`apiErrors.${code}`) : (job.error || i18n.t("apiErrors.requestFailed")));
+    }
+    if (job.state === "canceled") {
+      throw new DOMException("Aborted", "AbortError");
+    }
+    await sleep(forbiddenProbePollIntervalMs, signal);
+  }
+}
+
+async function runForbiddenProbeJob(
+  startPath: string,
+  body: object,
+  onProgress?: (value: AccountTaskProgressDTO) => void,
+  signal?: AbortSignal,
+): Promise<ForbiddenProbeResultDTO> {
+  const job = await apiRequest(startPath, { method: "POST", body, signal }, decodeForbiddenProbeJob);
+  onProgress?.({ completed: job.completed, total: job.total });
+  if (job.state === "completed" && job.result) {
+    return job.result;
+  }
+  try {
+    return await pollForbiddenProbeJob(job.id, onProgress, signal);
+  } catch (error) {
+    if (signal?.aborted || (error instanceof DOMException && error.name === "AbortError")) {
+      await cancelForbiddenProbeJob(job.id);
+    }
+    throw error;
+  }
+}
+
+type AccountTaskStreamPayload = Partial<
+  BuildConversionResultDTO &
+    AccountTaskProgressDTO &
+    AccountTokenRefreshResultDTO &
+    AccountImportResultDTO &
+    ForbiddenProbeResultDTO
+> & {
   code?: string;
   message?: string;
 };
@@ -329,6 +474,7 @@ const decodeAccountTaskStreamPayload = createObjectDecoder<AccountTaskStreamPayl
   created: isOptional(isNumber), linked: isOptional(isNumber), skipped: isOptional(isNumber), failed: isOptional(isNumber),
   synced: isOptional(isNumber), syncFailed: isOptional(isNumber), completed: isOptional(isNumber), total: isOptional(isNumber),
   phase: isOptional(isOneOf("importing", "converting", "syncing")), updated: isOptional(isNumber), succeeded: isOptional(isNumber),
+  probed: isOptional(isNumber), ok: isOptional(isNumber), forbidden: isOptional(isNumber), suspended: isOptional(isNumber), disabled: isOptional(isNumber),
   code: isOptional(isString), message: isOptional(isString),
 });
 
@@ -468,28 +614,32 @@ export function refreshAccountsTokens(ids: string[], provider: AccountProvider):
   return apiRequest("/api/admin/v1/accounts/batch/refresh-tokens", { method: "POST", body: { ids, provider } }, createObjectDecoder("account token refresh batch", { succeeded: isNumber, failed: isNumber, skipped: isNumber }));
 }
 
-export type ForbiddenProbeResultDTO = {
-  total: number;
-  probed: number;
-  ok: number;
-  forbidden: number;
-  failed: number;
-  skipped: number;
-  suspended: number;
-  disabled: number;
-};
-
-const decodeForbiddenProbeResult = createObjectDecoder("forbidden probe", {
-  total: isNumber, probed: isNumber, ok: isNumber, forbidden: isNumber,
-  failed: isNumber, skipped: isNumber, suspended: isNumber, disabled: isNumber,
-});
-
-export function probeAccountsForbidden(ids: string[], provider: AccountProvider): Promise<ForbiddenProbeResultDTO> {
-  return apiRequest("/api/admin/v1/accounts/batch/probe-forbidden", { method: "POST", body: { ids, provider } }, decodeForbiddenProbeResult);
+export function probeAccountsForbidden(
+  ids: string[],
+  provider: AccountProvider,
+  onProgress?: (value: AccountTaskProgressDTO) => void,
+  signal?: AbortSignal,
+): Promise<ForbiddenProbeResultDTO> {
+  // 异步任务 + 短轮询，避免 Cloudflare 代理长连接 524。
+  return runForbiddenProbeJob(
+    "/api/admin/v1/accounts/batch/probe-forbidden",
+    { ids, provider },
+    onProgress,
+    signal,
+  );
 }
 
-export function probeAllAccountsForbidden(provider: AccountProvider): Promise<ForbiddenProbeResultDTO> {
-  return apiRequest("/api/admin/v1/accounts/probe-forbidden", { method: "POST", body: { provider } }, decodeForbiddenProbeResult);
+export function probeAllAccountsForbidden(
+  provider: AccountProvider,
+  onProgress?: (value: AccountTaskProgressDTO) => void,
+  signal?: AbortSignal,
+): Promise<ForbiddenProbeResultDTO> {
+  return runForbiddenProbeJob(
+    "/api/admin/v1/accounts/probe-forbidden",
+    { provider },
+    onProgress,
+    signal,
+  );
 }
 
 export function cleanupAccounts(provider: AccountProvider, statuses: AccountCleanupStatus[]): Promise<{ deleted: number }> {

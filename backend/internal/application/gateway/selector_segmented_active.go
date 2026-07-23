@@ -66,7 +66,7 @@ func (s *Selector) acquireSegmentedCandidates(ctx context.Context, values []acco
 			}
 		} else {
 			concurrencyHints := make([]int, len(values))
-			cohorts := segmentedCandidateCohorts(values, indexes, now, tierOrder, preferFreeBuild)
+			cohorts := s.segmentedCandidateCohorts(values, indexes, now, tierOrder, preferFreeBuild)
 			roundWindows := 0
 			fallbackToFull := false
 			for cohortIndex, bucket := range cohorts {
@@ -155,13 +155,14 @@ func (s *Selector) claimSegmentedPlan(ctx context.Context, plan *candidatePlan, 
 	return nil, nil
 }
 
-func segmentedCandidateCohorts(values []account.RoutingCandidate, indexes []int, now time.Time, tierOrder []account.WebTier, preferFreeBuild bool) []segmentedSelectorCohortBucket {
+func (s *Selector) segmentedCandidateCohorts(values []account.RoutingCandidate, indexes []int, now time.Time, tierOrder []account.WebTier, preferFreeBuild bool) []segmentedSelectorCohortBucket {
 	buckets := make(map[segmentedSelectorCohort][]int)
 	appendCandidate := func(index int) {
 		candidate := values[index]
 		cohort := segmentedSelectorCohort{
 			supportsModel: candidate.SupportsModel, capabilityKnown: candidate.ModelCapabilityKnown,
 			preferFreeBuild: preferFreeBuild && candidate.IsKnownFreeBuild(),
+			botFlagged:      s.isBuildBotFlagged(candidate.Credential),
 			tier:            tierOrderRank(tierOrder, candidate.Credential.WebTier), priority: candidate.Credential.Priority,
 		}
 		if candidate.Billing != nil {

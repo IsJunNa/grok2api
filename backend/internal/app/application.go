@@ -300,6 +300,10 @@ func New(ctx context.Context, cfg config.Config, logger *slog.Logger) (*Applicat
 	selector := gateway.NewSelector(accountRepo, concurrency, sticky, providers, cfg.Routing.StickyTTL.Value(), cfg.Routing.CooldownBase.Value(), cfg.Routing.CooldownMax.Value(), cfg.Routing.CapacityWait.Value())
 	selector.UpdatePreferFreeBuild(cfg.Routing.PreferFreeBuild)
 	selector.UpdateSegmentedSelector(cfg.Routing.SegmentedSelectorEnabled, cfg.Routing.SegmentedMinCandidates, cfg.Routing.SegmentedWindowSize)
+	// Build JWT bot_flag_source=1 的账号在选号时降权，优先使用 clean 号。
+	selector.SetBuildBotFlagChecker(func(credential account.Credential) bool {
+		return providers.CredentialMetadata(credential).BuildBotFlagged
+	})
 	invalidationService := invalidationapp.NewService(invalidationBus, invalidationSourceInstance(cfg), selector.ApplyInvalidation, logger)
 	accountRepo.SetInvalidationObserver(invalidationService.Notify)
 	modelRepo.SetInvalidationObserver(invalidationService.Notify)

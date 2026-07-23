@@ -320,6 +320,8 @@ type Service struct {
 	forbiddenProbe         ForbiddenProbeConfig
 	forbiddenProbeRevision uint64
 	forbiddenProbeWake     chan struct{}
+	forbiddenProbeJobsMu   sync.Mutex
+	forbiddenProbeJobs     map[string]*forbiddenProbeJob
 	buildBotFlagCache      *resultcache.Cache[string, []uint64]
 	logger                 *slog.Logger
 	now                    func() time.Time
@@ -377,6 +379,7 @@ func NewService(accounts repository.AccountRepository, audits repository.AuditRe
 			Enabled: false, Interval: 6 * time.Hour, Concurrency: 5, BatchSize: 100, SkipSuspended: true,
 		},
 		forbiddenProbeWake: make(chan struct{}, 1),
+		forbiddenProbeJobs: make(map[string]*forbiddenProbeJob),
 		buildBotFlagCache:  resultcache.New[string, []uint64](1, buildBotFlagCacheTTL),
 		conversionPool:     batch.NewPool(25), syncPool: batch.NewPool(25), refreshPool: batch.NewPool(25), logger: slog.Default(),
 		now: func() time.Time { return time.Now().UTC() },
@@ -1721,6 +1724,44 @@ func (s *Service) Disable(ctx context.Context, id uint64, reason string) error {
 		_ = s.sticky.DeleteByAccount(ctx, id)
 	}
 	return nil
+}
+
+// ForbiddenMarkResult 是批量 403 标记的汇总（供 register / 管理端使用）。
+type ForbiddenMarkResult struct {
+	Updated   int      `json:"updated"`
+	Suspended int      `json:"suspended"`
+	Disabled  int      `json:"disabled"`
+	Failed    int      `json:"failed"`
+	IDs       []uint64 `json:"ids"`
+}
+
+// MarkAccountsForbidden 对指定账号应用与聊天 403 相同的 24h/永久策略（不发上游请求）。
+func (s *Service) MarkAccountsForbidden(ctx context.Context, ids []uint64, detail string) (ForbiddenMarkResult, error) {
+	values, err := normalizeBatchIDs(ids)
+	if err != nil {
+		return ForbiddenMarkResult{}, err
+	}
+	result := ForbiddenMarkResult{IDs: append([]uint64(nil), values...)}
+	for _, id := range values {
+		credential, getErr := s.accounts.Get(ctx, id)
+		if getErr != nil {
+			result.Failed++
+			continue
+		}
+		permanent, markErr := s.HandleChatForbidden(ctx, credential, detail)
+		if markErr != nil {
+			result.Failed++
+			s.logger.Warn("account_mark_forbidden_failed", "account_id", id, "error", markErr)
+			continue
+		}
+		result.Updated++
+		if permanent {
+			result.Disabled++
+		} else {
+			result.Suspended++
+		}
+	}
+	return result, nil
 }
 
 // HandleChatForbidden 处理聊天上游 403：
