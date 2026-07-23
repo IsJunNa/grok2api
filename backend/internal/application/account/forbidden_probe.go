@@ -383,8 +383,13 @@ func (s *Service) runForbiddenProbeJob(ctx context.Context, job *forbiddenProbeJ
 
 	progress := func(completed, total int) error {
 		job.mu.Lock()
-		job.completed = completed
-		job.total = total
+		// 只前进不回退，避免并发回调乱序把进度打回 0。
+		if total > job.total {
+			job.total = total
+		}
+		if completed > job.completed {
+			job.completed = completed
+		}
 		job.updatedAt = s.now()
 		job.mu.Unlock()
 		return ctx.Err()
@@ -430,8 +435,12 @@ func (s *Service) runForbiddenProbeJobForIDs(ctx context.Context, job *forbidden
 
 	progress := func(completed, total int) error {
 		job.mu.Lock()
-		job.completed = completed
-		job.total = total
+		if total > job.total {
+			job.total = total
+		}
+		if completed > job.completed {
+			job.completed = completed
+		}
 		job.updatedAt = s.now()
 		job.mu.Unlock()
 		return ctx.Err()
@@ -545,8 +554,12 @@ func (s *Service) probeForbiddenIDs(ctx context.Context, ids []uint64, providerF
 	if concurrency > len(ids) {
 		concurrency = len(ids)
 	}
+
+	// 固定 worker 池 + 任务队列：每完成一个账号立刻上报进度。
+	// 旧实现主 goroutine 先在信号量上把全部任务“启动完”才读 done，
+	// 进度回调被堵在启动循环之后，导致 completed 长时间为 0。
+	jobs := make(chan uint64)
 	type itemResult struct {
-		done      bool
 		skipped   bool
 		ok        bool
 		forbidden bool
@@ -554,83 +567,79 @@ func (s *Service) probeForbiddenIDs(ctx context.Context, ids []uint64, providerF
 		suspended bool
 		disabled  bool
 	}
-	results := make([]itemResult, len(ids))
-	sem := make(chan struct{}, concurrency)
-	done := make(chan int, len(ids))
-	var started int
-	for index, id := range ids {
-		if ctx.Err() != nil {
-			break
-		}
-		sem <- struct{}{}
-		started++
-		go func(i int, accountID uint64) {
-			defer func() {
-				<-sem
-				done <- i
-			}()
-			one := s.probeOneForbidden(ctx, accountID, providerFilter, cfg)
-			results[i] = itemResult{
-				done: true, skipped: one.skipped, ok: one.ok, forbidden: one.forbidden,
-				failed: one.failed, suspended: one.suspended, disabled: one.disabled,
+	results := make(chan itemResult, concurrency*2)
+	var workers sync.WaitGroup
+	for i := 0; i < concurrency; i++ {
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			for accountID := range jobs {
+				if ctx.Err() != nil {
+					// 丢弃剩余任务，不写入 results，避免取消后进度虚增。
+					continue
+				}
+				one := s.probeOneForbidden(ctx, accountID, providerFilter, cfg)
+				select {
+				case results <- itemResult{
+					skipped: one.skipped, ok: one.ok, forbidden: one.forbidden,
+					failed: one.failed, suspended: one.suspended, disabled: one.disabled,
+				}:
+				case <-ctx.Done():
+					return
+				}
 			}
-		}(index, id)
+		}()
 	}
+
+	go func() {
+		defer close(jobs)
+		for _, id := range ids {
+			select {
+			case <-ctx.Done():
+				return
+			case jobs <- id:
+			}
+		}
+	}()
+
+	go func() {
+		workers.Wait()
+		close(results)
+	}()
+
 	finished := 0
 	var progressErr error
-	for finished < started {
-		select {
-		case <-ctx.Done():
-			for finished < started {
-				<-done
-				finished++
-				if progress != nil && progressErr == nil {
-					if notifyErr := progress(finished, len(ids)); notifyErr != nil {
-						progressErr = notifyErr
-					}
-				}
-			}
-		case <-done:
-			finished++
-			if progress != nil && progressErr == nil {
-				if notifyErr := progress(finished, len(ids)); notifyErr != nil {
-					progressErr = notifyErr
-				}
-			}
-		}
-		if ctx.Err() != nil && finished >= started {
-			break
-		}
-	}
-	for _, item := range results {
-		if !item.done {
-			continue
-		}
+	for item := range results {
+		finished++
 		if item.skipped {
 			result.Skipped++
-			continue
+		} else {
+			result.Probed++
+			if item.ok {
+				result.OK++
+			}
+			if item.forbidden {
+				result.Forbidden++
+			}
+			if item.failed {
+				result.Failed++
+			}
+			if item.suspended {
+				result.Suspended++
+			}
+			if item.disabled {
+				result.Disabled++
+			}
 		}
-		result.Probed++
-		if item.ok {
-			result.OK++
-		}
-		if item.forbidden {
-			result.Forbidden++
-		}
-		if item.failed {
-			result.Failed++
-		}
-		if item.suspended {
-			result.Suspended++
-		}
-		if item.disabled {
-			result.Disabled++
+		if progress != nil && progressErr == nil {
+			if notifyErr := progress(finished, len(ids)); notifyErr != nil {
+				progressErr = notifyErr
+			}
 		}
 	}
 	if progressErr != nil {
 		return result, progressErr
 	}
-	// 正常完成时忽略父 ctx 已取消（客户端断开）以外的统计错误；超时则返回错误。
 	if ctx.Err() != nil && finished < len(ids) {
 		return result, ctx.Err()
 	}
