@@ -122,10 +122,15 @@ type clientKeyDefaultsConfigDTO struct {
 }
 
 type accountsConfigDTO struct {
-	AutoCleanReauthEnabled   bool   `json:"autoCleanReauthEnabled"`
-	AutoCleanReauthInterval  string `json:"autoCleanReauthInterval"`
-	AutoCleanReauthMinAge    string `json:"autoCleanReauthMinAge"`
-	AutoCleanIncludeDisabled bool   `json:"autoCleanIncludeDisabled"`
+	AutoCleanReauthEnabled      bool   `json:"autoCleanReauthEnabled"`
+	AutoCleanReauthInterval     string `json:"autoCleanReauthInterval"`
+	AutoCleanReauthMinAge       string `json:"autoCleanReauthMinAge"`
+	AutoCleanIncludeDisabled    bool   `json:"autoCleanIncludeDisabled"`
+	ForbiddenProbeEnabled       bool   `json:"forbiddenProbeEnabled"`
+	ForbiddenProbeInterval      string `json:"forbiddenProbeInterval"`
+	ForbiddenProbeConcurrency   int    `json:"forbiddenProbeConcurrency"`
+	ForbiddenProbeBatchSize     int    `json:"forbiddenProbeBatchSize"`
+	ForbiddenProbeSkipSuspended bool   `json:"forbiddenProbeSkipSuspended"`
 }
 
 type settingsResponse struct {
@@ -231,10 +236,15 @@ func (value settingsConfigDTO) toApplication() settingsapp.EditableConfig {
 	}
 	if value.Accounts != nil {
 		result.Accounts = settingsapp.AccountsConfig{
-			AutoCleanReauthEnabled:   value.Accounts.AutoCleanReauthEnabled,
-			AutoCleanReauthInterval:  value.Accounts.AutoCleanReauthInterval,
-			AutoCleanReauthMinAge:    value.Accounts.AutoCleanReauthMinAge,
-			AutoCleanIncludeDisabled: value.Accounts.AutoCleanIncludeDisabled,
+			AutoCleanReauthEnabled:      value.Accounts.AutoCleanReauthEnabled,
+			AutoCleanReauthInterval:     value.Accounts.AutoCleanReauthInterval,
+			AutoCleanReauthMinAge:       value.Accounts.AutoCleanReauthMinAge,
+			AutoCleanIncludeDisabled:    value.Accounts.AutoCleanIncludeDisabled,
+			ForbiddenProbeEnabled:       value.Accounts.ForbiddenProbeEnabled,
+			ForbiddenProbeInterval:      value.Accounts.ForbiddenProbeInterval,
+			ForbiddenProbeConcurrency:   value.Accounts.ForbiddenProbeConcurrency,
+			ForbiddenProbeBatchSize:     value.Accounts.ForbiddenProbeBatchSize,
+			ForbiddenProbeSkipSuspended: value.Accounts.ForbiddenProbeSkipSuspended,
 		}
 		result.AccountsProvided = true
 	}
@@ -295,10 +305,15 @@ func newSettingsResponse(value settingsapp.Snapshot) settingsResponse {
 				RPMLimit: config.ClientKeyDefaults.RPMLimit, MaxConcurrent: config.ClientKeyDefaults.MaxConcurrent,
 			},
 			Accounts: &accountsConfigDTO{
-				AutoCleanReauthEnabled:   config.Accounts.AutoCleanReauthEnabled,
-				AutoCleanReauthInterval:  config.Accounts.AutoCleanReauthInterval,
-				AutoCleanReauthMinAge:    config.Accounts.AutoCleanReauthMinAge,
-				AutoCleanIncludeDisabled: config.Accounts.AutoCleanIncludeDisabled,
+				AutoCleanReauthEnabled:      config.Accounts.AutoCleanReauthEnabled,
+				AutoCleanReauthInterval:     config.Accounts.AutoCleanReauthInterval,
+				AutoCleanReauthMinAge:       config.Accounts.AutoCleanReauthMinAge,
+				AutoCleanIncludeDisabled:    config.Accounts.AutoCleanIncludeDisabled,
+				ForbiddenProbeEnabled:       config.Accounts.ForbiddenProbeEnabled,
+				ForbiddenProbeInterval:      config.Accounts.ForbiddenProbeInterval,
+				ForbiddenProbeConcurrency:   config.Accounts.ForbiddenProbeConcurrency,
+				ForbiddenProbeBatchSize:     config.Accounts.ForbiddenProbeBatchSize,
+				ForbiddenProbeSkipSuspended: config.Accounts.ForbiddenProbeSkipSuspended,
 			},
 		},
 		RecommendedProviderBuild: providerBuildRecommendationDTO{

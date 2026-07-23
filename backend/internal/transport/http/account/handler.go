@@ -153,6 +153,8 @@ func (h *Handler) Register(router *gin.RouterGroup) {
 	router.POST("/accounts/batch/refresh-billing", h.batchRefreshBilling)
 	router.POST("/accounts/batch/refresh-quotas", h.batchRefreshQuotas)
 	router.POST("/accounts/batch/refresh-tokens", h.batchRefreshTokens)
+	router.POST("/accounts/batch/probe-forbidden", h.batchProbeForbidden)
+	router.POST("/accounts/probe-forbidden", h.probeAllForbidden)
 	router.PATCH("/accounts/batch", h.batchUpdate)
 	router.DELETE("/accounts", h.batchDelete)
 	router.PATCH("/accounts/:id", h.update)
@@ -547,6 +549,64 @@ func (h *Handler) batchRefreshTokens(c *gin.Context) {
 		return
 	}
 	response.Success(c, http.StatusOK, gin.H{"succeeded": succeeded, "failed": failed, "skipped": skipped})
+}
+
+func (h *Handler) batchProbeForbidden(c *gin.Context) {
+	var request batchDeleteRequest
+	if c.ShouldBindJSON(&request) != nil {
+		response.Error(c, http.StatusBadRequest, "invalidRequest", "请求参数无效")
+		return
+	}
+	ids, err := parseIDs(request.IDs)
+	if err != nil {
+		response.Error(c, http.StatusBadRequest, "invalidId", err.Error())
+		return
+	}
+	providerValue := accountdomain.Provider(request.Provider)
+	if !providerValue.IsValid() {
+		response.Error(c, http.StatusBadRequest, "invalidProvider", "账号来源无效")
+		return
+	}
+	if !h.validateProviderIDs(c, ids, request.Provider) {
+		return
+	}
+	result, err := h.service.ProbeForbidden(c.Request.Context(), ids, request.Provider, h.forbiddenProbeConfig())
+	if err != nil {
+		h.writeServiceError(c, "forbiddenProbeFailed", err, http.StatusBadGateway, "403 检测失败")
+		return
+	}
+	response.Success(c, http.StatusOK, result)
+}
+
+func (h *Handler) probeAllForbidden(c *gin.Context) {
+	var request struct {
+		Provider string `json:"provider"`
+	}
+	if c.ShouldBindJSON(&request) != nil {
+		response.Error(c, http.StatusBadRequest, "invalidRequest", "请求参数无效")
+		return
+	}
+	if request.Provider != "" && !accountdomain.Provider(request.Provider).IsValid() {
+		response.Error(c, http.StatusBadRequest, "invalidProvider", "账号来源无效")
+		return
+	}
+	result, err := h.service.ProbeAllForbidden(c.Request.Context(), request.Provider, h.forbiddenProbeConfig())
+	if err != nil {
+		h.writeServiceError(c, "forbiddenProbeFailed", err, http.StatusBadGateway, "403 检测失败")
+		return
+	}
+	response.Success(c, http.StatusOK, result)
+}
+
+func (h *Handler) forbiddenProbeConfig() accountapp.ForbiddenProbeConfig {
+	// 手动检测使用运行设置中的并发/跳过策略；Enabled 对手动检测强制为 true。
+	cfg := h.service.ForbiddenProbeConfigSnapshot()
+	cfg.Enabled = true
+	if cfg.BatchSize < 1000 {
+		// 手动全量/批量检测允许更大批次，仍受设置上限 1000。
+		cfg.BatchSize = 1000
+	}
+	return cfg
 }
 
 func (h *Handler) get(c *gin.Context) {

@@ -699,19 +699,15 @@ attemptLoop:
 			retryAfter := parseRetryAfter(response.Header.Get("Retry-After"), time.Now().UTC())
 			body, _ := readRetryableBody(response.Body)
 			lastFailure = newHTTPUpstreamFailure(response.StatusCode, body, credential.ID, credential.Name)
-			// 聊天链路遇到 403：默认停用当前账号并换号，避免坏号反复被选中。
+			// 聊天链路遇到 403：账号级 24h 临时封禁后换号；24h 放回后再 403 则永久停用。
+			// 覆盖 Web anti-bot 与 Build permission-denied（含注册机 bot_flag / 试用号聊天拒绝）。
 			// Web Provider 内部仍会先失效 Statsig 并重试一次；走到网关的 403 视为该账号本次不可用。
-			// Build 的「单模型 chat 拒绝」例外：只隔离模型，保留 OAuth 与视频能力。
 			if response.StatusCode == http.StatusForbidden {
 				if s.providers.SupportsCredentialRefresh(credential.Provider) && !authRecoveryAttempted[credential.ID] && credential.EncryptedRefreshToken != "" && (lastFailure.PermanentAccountDenial || lastFailure.CredentialRejected) {
 					authRecoveryAttempted[credential.ID] = true
 					refreshed, refreshErr := ensureCredential(credential, true)
 					if refreshErr != nil {
-						if credential.Provider == accountdomain.ProviderBuild && lastFailure.PermanentAccountDenial {
-							s.selector.MarkModelAccessDenied(ctx, credential, route.UpstreamModel, retryAfter)
-						} else {
-							s.disableAccountAfterChatForbidden(ctx, credential, body)
-						}
+						s.handleChatForbidden(ctx, credential, body)
 						lease.Release()
 						lastErr = refreshErr
 						lastFailure = newCredentialUpstreamFailure(refreshErr, credential.ID, credential.Name)
@@ -720,9 +716,7 @@ attemptLoop:
 					response, err = forwardResponse(lease, refreshed, lease.Billing)
 					credential = refreshed
 					if err != nil {
-						if credential.Provider != accountdomain.ProviderBuild || !lastFailure.PermanentAccountDenial {
-							s.disableAccountAfterChatForbidden(ctx, credential, body)
-						}
+						s.handleChatForbidden(ctx, credential, body)
 						lease.Release()
 						lastErr = err
 						if ctx.Err() != nil || errors.Is(err, context.Canceled) {
@@ -741,17 +735,15 @@ attemptLoop:
 					body, _ = readRetryableBody(response.Body)
 					lastFailure = newHTTPUpstreamFailure(response.StatusCode, body, credential.ID, credential.Name)
 				}
-				if credential.Provider == accountdomain.ProviderBuild && lastFailure.PermanentAccountDenial {
-					s.selector.MarkModelAccessDenied(ctx, credential, route.UpstreamModel, retryAfter)
-					lease.Release()
-					lastErr = fmt.Errorf("上游返回 403")
-					s.logger.Warn("upstream_request_failed", "request_id", input.RequestID, "account_id", credential.ID, "provider", credential.Provider, "status", response.StatusCode, "upstream_code", lastFailure.UpstreamCode, "account_scoped", true, "model_scoped", true)
-					continue
-				}
-				s.disableAccountAfterChatForbidden(ctx, credential, body)
+				permanent := s.handleChatForbidden(ctx, credential, body)
 				lease.Release()
-				lastErr = fmt.Errorf("上游返回 403，账号已停用")
-				s.logger.Warn("upstream_forbidden_account_disabled", "request_id", input.RequestID, "account_id", credential.ID, "provider", credential.Provider, "upstream_code", lastFailure.UpstreamCode)
+				if permanent {
+					lastErr = fmt.Errorf("上游返回 403，账号已永久停用")
+					s.logger.Warn("upstream_forbidden_account_disabled", "request_id", input.RequestID, "account_id", credential.ID, "provider", credential.Provider, "upstream_code", lastFailure.UpstreamCode, "permission_denied", lastFailure.PermanentAccountDenial)
+				} else {
+					lastErr = fmt.Errorf("上游返回 403，账号已临时封禁 24h")
+					s.logger.Warn("upstream_forbidden_account_suspended", "request_id", input.RequestID, "account_id", credential.ID, "provider", credential.Provider, "upstream_code", lastFailure.UpstreamCode, "permission_denied", lastFailure.PermanentAccountDenial, "cooldown", accountdomain.ChatForbiddenCooldown)
+				}
 				continue
 			}
 			if response.StatusCode == http.StatusTooManyRequests && response.RateLimit != nil && response.RateLimit.TeamID != "" && response.RateLimit.Model == route.UpstreamModel {
@@ -815,14 +807,8 @@ attemptLoop:
 				failureHandled = true
 			}
 			if s.providers.SupportsCredentialRefresh(credential.Provider) && lastFailure.PermanentAccountDenial {
-				if credential.Provider == accountdomain.ProviderBuild {
-					// A Build account may lack permission for one chat model while its OAuth credential and video
-					// access remain valid. Isolate this denial to the model; reauthorization is needed only when the credential is rejected.
-					s.selector.MarkModelAccessDenied(ctx, credential, route.UpstreamModel, retryAfter)
-				} else {
-					_ = s.accounts.MarkReauthRequired(ctx, credential.ID, fmt.Sprintf("%s chat endpoint access denied", credential.Provider))
-					s.selector.MarkQuotaStateChanged(credential.Provider)
-				}
+				// 聊天端点 permission-denied 已在上方 403 分支按 24h 封禁处理；此处兜底其它路径。
+				s.handleChatForbidden(ctx, credential, body)
 				failureHandled = true
 			} else if s.providers.SupportsCredentialRefresh(credential.Provider) && lastFailure.CredentialRejected {
 				_ = s.accounts.MarkReauthRequired(ctx, credential.ID, fmt.Sprintf("%s credential rejected", credential.Provider))
@@ -1026,21 +1012,23 @@ func (s *Service) markSSOCredentialRejected(ctx context.Context, credential acco
 	s.selector.MarkQuotaStateChanged(credential.Provider)
 }
 
-// disableAccountAfterChatForbidden 在聊天上游返回 403 后停用账号并失效调度缓存，随后由 attempt 循环换号。
-func (s *Service) disableAccountAfterChatForbidden(ctx context.Context, credential accountdomain.Credential, body []byte) {
-	reason := "聊天上游返回 403，账号已自动停用"
+// handleChatForbidden 在聊天上游 403 后执行 24h 临时封禁或二次永久停用，并失效调度缓存。
+// 返回 true 表示已永久停用。
+func (s *Service) handleChatForbidden(ctx context.Context, credential accountdomain.Credential, body []byte) bool {
+	detail := "上游拒绝了该请求"
 	if code, _, message := extractUpstreamErrorMetadata(body); code != "" || message != "" {
-		detail := strings.TrimSpace(firstNonEmptyFailure(code, message))
-		if detail != "" {
-			reason = "聊天上游返回 403: " + detail
+		if value := strings.TrimSpace(firstNonEmptyFailure(code, message)); value != "" {
+			detail = value
 		}
 	}
 	writeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), finalizationTimeout)
 	defer cancel()
-	if err := s.accounts.Disable(writeCtx, credential.ID, reason); err != nil {
-		s.logger.Error("account_disable_after_forbidden_failed", "account_id", credential.ID, "provider", credential.Provider, "error", err)
+	permanent, err := s.accounts.HandleChatForbidden(writeCtx, credential, detail)
+	if err != nil {
+		s.logger.Error("account_chat_forbidden_handle_failed", "account_id", credential.ID, "provider", credential.Provider, "error", err)
 	}
 	s.selector.MarkQuotaStateChanged(credential.Provider)
+	return permanent
 }
 
 func (s *Service) queueAccountModelSync(accountID uint64) {

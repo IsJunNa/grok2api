@@ -816,7 +816,7 @@ func TestParseFreeQuotaExhaustion(t *testing.T) {
 	}
 }
 
-func TestGatewayDisablesAccountsAfterChatForbidden(t *testing.T) {
+func TestGatewaySuspendsAccountsFor24hAfterChatForbidden(t *testing.T) {
 	ctx := context.Background()
 	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "systemic-forbidden.db"))
 	if err != nil {
@@ -881,13 +881,14 @@ func TestGatewayDisablesAccountsAfterChatForbidden(t *testing.T) {
 	if len(attempts) != 3 || attempts[0] != credentials[0].ID || attempts[1] != credentials[1].ID || attempts[2] != credentials[2].ID {
 		t.Fatalf("attempts = %#v", attempts)
 	}
+	now := time.Now().UTC()
 	for _, credential := range credentials {
 		observed, getErr := accountRepo.Get(ctx, credential.ID)
 		if getErr != nil {
 			t.Fatal(getErr)
 		}
-		if observed.Enabled || !strings.Contains(observed.LastError, "403") {
-			t.Fatalf("account %d was not disabled after 403: %#v", credential.ID, observed)
+		if !observed.Enabled || !account.IsChatForbiddenSuspend(observed.LastError) || observed.CooldownUntil == nil || !observed.CooldownUntil.After(now.Add(23*time.Hour)) {
+			t.Fatalf("account %d was not suspended for 24h after 403: %#v", credential.ID, observed)
 		}
 	}
 	logs, total, err := auditRepo.List(ctx, 0, 10)
@@ -896,7 +897,93 @@ func TestGatewayDisablesAccountsAfterChatForbidden(t *testing.T) {
 	}
 }
 
-func TestGatewayDisablesWebAccountsAfterChatForbiddenAndRotates(t *testing.T) {
+func TestGatewayPermanentlyDisablesAccountAfterRecoveredChatForbidden(t *testing.T) {
+	ctx := context.Background()
+	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "forbidden-permanent.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	if err := database.InitializeSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+	accountRepo := relational.NewAccountRepository(database)
+	modelRepo := relational.NewModelRepository(database)
+	auditRepo := relational.NewAuditRepository(database)
+	responseRepo := relational.NewResponseRepository(database)
+	keyRepo := relational.NewClientKeyRepository(database)
+
+	past := time.Now().UTC().Add(-time.Minute)
+	bad, _, err := accountRepo.UpsertByIdentity(ctx, account.Credential{
+		Provider: account.ProviderBuild, Name: "recovered-bad", SourceKey: "recovered-bad", EncryptedAccessToken: "token-bad",
+		ExpiresAt: time.Now().Add(time.Hour), Enabled: true, AuthStatus: account.AuthStatusActive, Priority: 200, MaxConcurrent: 1,
+		LastError: account.ChatForbiddenSuspendPrefix + "previous anti-bot", CooldownUntil: &past, FailureCount: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	good, _, err := accountRepo.UpsertByIdentity(ctx, account.Credential{
+		Provider: account.ProviderBuild, Name: "good", SourceKey: "good", EncryptedAccessToken: "token-good",
+		ExpiresAt: time.Now().Add(time.Hour), Enabled: true, AuthStatus: account.AuthStatusActive, Priority: 100, MaxConcurrent: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := modelRepo.UpsertDiscovered(ctx, account.ProviderBuild, []string{"grok-permanent-403"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, credential := range []account.Credential{bad, good} {
+		if err := modelRepo.ReplaceAccountCapabilities(ctx, credential.ID, []string{"grok-permanent-403"}, time.Now().UTC()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Upsert 会保留已有 health 字段；显式写回 403 探活标记。
+	if err := accountRepo.UpdateHealth(ctx, bad.ID, 1, &past, account.ChatForbiddenSuspendPrefix+"previous anti-bot", false); err != nil {
+		t.Fatal(err)
+	}
+	clientKey, err := keyRepo.Create(ctx, clientkey.Key{
+		Name: "perm-key", Prefix: "permkey", SecretHash: strings.Repeat("d", 64), EncryptedSecret: "encrypted",
+		Enabled: true, RPMLimit: 120, MaxConcurrent: 8,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	buildAdapter := &buildForbiddenThenOKAdapter{badAccountID: bad.ID}
+	registry := provider.NewRegistry(buildAdapter)
+	sticky := memory.NewStickyStore()
+	accountService := accountapp.NewService(accountRepo, auditRepo, memory.NewDeviceSessionStore(), sticky, registry, testCipher(t), nil)
+	selector := NewSelector(accountRepo, memory.NewConcurrencyLimiter(), sticky, registry, time.Hour, time.Second, time.Minute)
+	service := NewService(modelRepo, auditRepo, accountService, clientkeyapp.NewService(nil, nil, nil, 60, 4, nil), registry, selector, responseRepo, 3)
+
+	result, err := service.CreateResponse(ctx, Input{
+		RequestID: "req-permanent-403", ClientKey: clientKey, PublicModel: "grok-permanent-403",
+		Body: []byte(`{"model":"grok-permanent-403","input":"hello"}`),
+	})
+	if err != nil {
+		t.Fatalf("CreateResponse error = %v", err)
+	}
+	if result.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d", result.StatusCode)
+	}
+	_ = result.Body.Close()
+
+	observedBad, err := accountRepo.Get(ctx, bad.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if observedBad.Enabled || !account.IsChatForbiddenDisabled(observedBad.LastError) {
+		t.Fatalf("bad account was not permanently disabled: %#v", observedBad)
+	}
+	observedGood, err := accountRepo.Get(ctx, good.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !observedGood.Enabled || account.IsChatForbiddenMarked(observedGood.LastError) {
+		t.Fatalf("good account unexpected state: %#v", observedGood)
+	}
+}
+
+func TestGatewaySuspendsWebAccountsAfterChatForbiddenAndRotates(t *testing.T) {
 	ctx := context.Background()
 	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "web-forbidden.db"))
 	if err != nil {
@@ -972,15 +1059,19 @@ func TestGatewayDisablesWebAccountsAfterChatForbiddenAndRotates(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if observedBad.Enabled || !strings.Contains(observedBad.LastError, "403") {
-		t.Fatalf("bad account was not disabled: %#v", observedBad)
+	if !observedBad.Enabled || !account.IsChatForbiddenSuspend(observedBad.LastError) || observedBad.CooldownUntil == nil {
+		t.Fatalf("bad account was not suspended: %#v", observedBad)
 	}
+	// 成功号应清理健康态；至少保持启用。
 	observedGood, err := accountRepo.Get(ctx, good.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !observedGood.Enabled {
 		t.Fatalf("good account should remain enabled: %#v", observedGood)
+	}
+	if account.IsChatForbiddenSuspend(observedGood.LastError) {
+		t.Fatalf("good account should not keep 403 mark after success: %#v", observedGood)
 	}
 	attempts := adapter.Attempts()
 	if len(attempts) != 2 || attempts[0] != bad.ID || attempts[1] != good.ID {
@@ -1073,9 +1164,9 @@ func TestGatewayRefreshesAndRetriesBuildPermissionDenialOnce(t *testing.T) {
 	}
 }
 
-func TestBuildChatPermissionDenialDoesNotInvalidateVideoCredential(t *testing.T) {
+func TestBuildChatPermissionDenialSuspendsAccountFor24h(t *testing.T) {
 	ctx := context.Background()
-	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "model-scoped-denial.db"))
+	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "permission-denied-24h.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1089,7 +1180,7 @@ func TestBuildChatPermissionDenialDoesNotInvalidateVideoCredential(t *testing.T)
 	responseRepo := relational.NewResponseRepository(database)
 	keyRepo := relational.NewClientKeyRepository(database)
 	credential, _, err := accountRepo.UpsertByIdentity(ctx, account.Credential{
-		Provider: account.ProviderBuild, Name: "chat-denied-video-valid", SourceKey: "chat-denied-video-valid",
+		Provider: account.ProviderBuild, Name: "chat-denied", SourceKey: "chat-denied",
 		EncryptedAccessToken: "access-old", EncryptedRefreshToken: "refresh-old", ExpiresAt: time.Now().Add(time.Hour),
 		Enabled: true, AuthStatus: account.AuthStatusActive, Priority: 100, MaxConcurrent: 1,
 	})
@@ -1130,15 +1221,11 @@ func TestBuildChatPermissionDenialDoesNotInvalidateVideoCredential(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !updated.Enabled || updated.AuthStatus != account.AuthStatusActive || updated.FailureCount != 0 || updated.CooldownUntil != nil {
-		t.Fatalf("chat denial invalidated the whole credential: %#v", updated)
-	}
-	candidates, err := accountRepo.ListRoutingCandidates(ctx, account.ProviderBuild, "grok-chat-denied", "")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(candidates) != 1 || candidates[0].ModelQuotaBlock == nil || candidates[0].ModelQuotaBlock.Reason != "model_access_denied" {
-		t.Fatalf("model-scoped denial was not persisted: %#v", candidates)
+	// permission-denied 按账号 24h 临时封禁：保持 enabled，不 reauth，列表显示 403。
+	// 不因单模型拒绝整号永久作废；OAuth 仍在，24h 后自动回池。
+	now := time.Now().UTC()
+	if !updated.Enabled || updated.AuthStatus != account.AuthStatusActive || !account.IsChatForbiddenSuspend(updated.LastError) || updated.CooldownUntil == nil || !updated.CooldownUntil.After(now.Add(23*time.Hour)) {
+		t.Fatalf("permission-denied was not suspended for 24h: %#v", updated)
 	}
 }
 
@@ -1796,6 +1883,32 @@ func (a *webForbiddenThenOKAdapter) Attempts() []uint64 {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	return append([]uint64(nil), a.attempts...)
+}
+
+type buildForbiddenThenOKAdapter struct {
+	mu           sync.Mutex
+	attempts     []uint64
+	badAccountID uint64
+}
+
+func (a *buildForbiddenThenOKAdapter) Provider() account.Provider { return account.ProviderBuild }
+func (a *buildForbiddenThenOKAdapter) Definition() provider.Definition {
+	return testConversationDefinition(account.ProviderBuild)
+}
+func (a *buildForbiddenThenOKAdapter) ForwardResponse(_ context.Context, request provider.ResponseResourceRequest) (*provider.Response, error) {
+	a.mu.Lock()
+	a.attempts = append(a.attempts, request.Credential.ID)
+	a.mu.Unlock()
+	if request.Credential.ID == a.badAccountID {
+		return &provider.Response{
+			StatusCode: http.StatusForbidden, Status: "403 Forbidden", Header: make(http.Header),
+			Body: io.NopCloser(strings.NewReader(`{"error":"upstream policy rejected request"}`)),
+		}, nil
+	}
+	return &provider.Response{
+		StatusCode: http.StatusOK, Status: "200 OK", Header: make(http.Header),
+		Body: io.NopCloser(strings.NewReader(`{"id":"resp-build-ok"}`)),
+	}, nil
 }
 
 type webStoredResponseAdapter struct{}

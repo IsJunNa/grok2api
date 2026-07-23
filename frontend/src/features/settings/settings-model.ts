@@ -132,6 +132,14 @@ export const settingsSchema = z.object({
       return seconds >= 60 && seconds <= 30 * 86_400;
     }),
     autoCleanIncludeDisabled: z.boolean(),
+    forbiddenProbeEnabled: z.boolean(),
+    forbiddenProbeInterval: durationSchema.refine((value) => {
+      const seconds = durationSeconds(value);
+      return seconds >= 3_600 && seconds <= 86_400;
+    }),
+    forbiddenProbeConcurrency: z.number().int().min(1).max(20),
+    forbiddenProbeBatchSize: z.number().int().min(10).max(1_000),
+    forbiddenProbeSkipSuspended: z.boolean(),
   }),
 });
 
@@ -172,6 +180,11 @@ export function toSettingsForm(config: SettingsConfigDTO): SettingsForm {
       autoCleanReauthInterval: parseDuration(config.accounts.autoCleanReauthInterval),
       autoCleanReauthMinAge: parseDuration(config.accounts.autoCleanReauthMinAge),
       autoCleanIncludeDisabled: config.accounts.autoCleanIncludeDisabled,
+      forbiddenProbeEnabled: config.accounts.forbiddenProbeEnabled,
+      forbiddenProbeInterval: parseDuration(config.accounts.forbiddenProbeInterval),
+      forbiddenProbeConcurrency: config.accounts.forbiddenProbeConcurrency,
+      forbiddenProbeBatchSize: config.accounts.forbiddenProbeBatchSize,
+      forbiddenProbeSkipSuspended: config.accounts.forbiddenProbeSkipSuspended,
     },
   };
 }
@@ -210,6 +223,11 @@ export function toSettingsDTO(config: SettingsForm): SettingsConfigDTO {
       autoCleanReauthInterval: formatDuration(config.accounts.autoCleanReauthInterval),
       autoCleanReauthMinAge: formatDuration(config.accounts.autoCleanReauthMinAge),
       autoCleanIncludeDisabled: config.accounts.autoCleanIncludeDisabled,
+      forbiddenProbeEnabled: config.accounts.forbiddenProbeEnabled,
+      forbiddenProbeInterval: formatDuration(config.accounts.forbiddenProbeInterval),
+      forbiddenProbeConcurrency: config.accounts.forbiddenProbeConcurrency,
+      forbiddenProbeBatchSize: config.accounts.forbiddenProbeBatchSize,
+      forbiddenProbeSkipSuspended: config.accounts.forbiddenProbeSkipSuspended,
     },
   };
 }

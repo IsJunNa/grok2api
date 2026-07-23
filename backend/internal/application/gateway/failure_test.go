@@ -38,6 +38,22 @@ func TestTransportUpstreamFailureClassifiesResponseHeaderTimeout(t *testing.T) {
 	}
 }
 
+func TestIsPermanentAccountDenialMatchesBuildChatPermissionDenied(t *testing.T) {
+	samples := []string{
+		"access to the chat endpoint is denied. please ensure you're using the correct credentials. if you believe this is a mistake, please log into console.x.ai and update the permissions, or contact support.",
+		"permission-denied access to the chat endpoint is denied",
+		"access denied",
+	}
+	for _, sample := range samples {
+		if !isPermanentAccountDenial(sample) {
+			t.Fatalf("expected permanent denial for %q", sample)
+		}
+	}
+	if isPermanentAccountDenial("request rejected by anti-bot rules") {
+		t.Fatal("anti-bot message must not be classified as permanent chat denial")
+	}
+}
+
 func TestHTTPUpstreamFailureClassifiesBuildForbiddenBodies(t *testing.T) {
 	tests := []struct {
 		name                   string

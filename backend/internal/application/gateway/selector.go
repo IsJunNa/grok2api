@@ -574,7 +574,9 @@ func (s *Selector) MarkSuccess(ctx context.Context, credential account.Credentia
 
 func (s *Selector) markSuccess(ctx context.Context, credential account.Credential, quotaProbe bool) {
 	now := time.Now().UTC()
-	persist := credential.FailureCount > 0 || credential.CooldownUntil != nil || credential.LastError != ""
+	// 聊天 403 临时封禁放回后若请求成功，必须清掉 403: 标记，避免下次 403 误判为「二次失败」永久停用。
+	chatForbiddenProbe := account.IsChatForbiddenSuspend(credential.LastError)
+	persist := credential.FailureCount > 0 || credential.CooldownUntil != nil || credential.LastError != "" || chatForbiddenProbe
 	s.selectionMu.Lock()
 	if last := s.lastSuccessAt[credential.ID]; last.IsZero() || now.Sub(last) >= successPersistInterval {
 		persist = true
@@ -589,7 +591,7 @@ func (s *Selector) markSuccess(ctx context.Context, credential account.Credentia
 	if quotaProbe {
 		_ = s.accounts.ClearQuotaRecovery(ctx, credential.ID)
 	}
-	if quotaProbe || credential.FailureCount > 0 || credential.CooldownUntil != nil || credential.LastError != "" {
+	if quotaProbe || credential.FailureCount > 0 || credential.CooldownUntil != nil || credential.LastError != "" || chatForbiddenProbe {
 		s.invalidateCandidates(credential.Provider)
 	}
 }

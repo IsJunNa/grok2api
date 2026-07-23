@@ -312,13 +312,17 @@ type Service struct {
 	syncPool              *batch.Pool
 	refreshPool           *batch.Pool
 	credentialRefreshWake chan struct{}
-	autoCleanMu           sync.RWMutex
-	autoClean             AutoCleanConfig
-	autoCleanRevision     uint64
-	autoCleanWake         chan struct{}
-	buildBotFlagCache     *resultcache.Cache[string, []uint64]
-	logger                *slog.Logger
-	now                   func() time.Time
+	autoCleanMu            sync.RWMutex
+	autoClean              AutoCleanConfig
+	autoCleanRevision      uint64
+	autoCleanWake          chan struct{}
+	forbiddenProbeMu       sync.RWMutex
+	forbiddenProbe         ForbiddenProbeConfig
+	forbiddenProbeRevision uint64
+	forbiddenProbeWake     chan struct{}
+	buildBotFlagCache      *resultcache.Cache[string, []uint64]
+	logger                 *slog.Logger
+	now                    func() time.Time
 }
 
 func (s *Service) SetQuotaRecoveryQueue(queue repository.QuotaRecoveryQueue) {
@@ -368,9 +372,13 @@ func NewService(accounts repository.AccountRepository, audits repository.AuditRe
 		autoClean: AutoCleanConfig{
 			Enabled: false, Interval: 10 * time.Minute, MinAge: time.Hour, IncludeDisabled: false,
 		},
-		autoCleanWake:     make(chan struct{}, 1),
-		buildBotFlagCache: resultcache.New[string, []uint64](1, buildBotFlagCacheTTL),
-		conversionPool:    batch.NewPool(25), syncPool: batch.NewPool(25), refreshPool: batch.NewPool(25), logger: slog.Default(),
+		autoCleanWake: make(chan struct{}, 1),
+		forbiddenProbe: ForbiddenProbeConfig{
+			Enabled: false, Interval: 6 * time.Hour, Concurrency: 5, BatchSize: 100, SkipSuspended: true,
+		},
+		forbiddenProbeWake: make(chan struct{}, 1),
+		buildBotFlagCache:  resultcache.New[string, []uint64](1, buildBotFlagCacheTTL),
+		conversionPool:     batch.NewPool(25), syncPool: batch.NewPool(25), refreshPool: batch.NewPool(25), logger: slog.Default(),
 		now: func() time.Time { return time.Now().UTC() },
 	}
 }
@@ -412,7 +420,7 @@ func (s *Service) List(ctx context.Context, page, pageSize int, search string, f
 	page, pageSize = normalizePage(page, pageSize)
 	if (filter.Provider != "" && !accountdomain.Provider(filter.Provider).IsValid()) ||
 		!oneOf(filter.QuotaType, "", "free", "paid", "unknown", "auto", "basic", "super", "heavy") ||
-		!oneOf(filter.Status, "", "active", "disabled", "reauthRequired", "cooldown", "waitingReset", "probing") ||
+		!oneOf(filter.Status, "", "active", "disabled", "reauthRequired", "cooldown", "forbidden", "waitingReset", "probing") ||
 		!oneOf(filter.Egress, "", "bound", "unbound") ||
 		!oneOf(filter.Renewal, "", "refreshable", "unrefreshable") ||
 		!oneOf(filter.Risk, "", "flagged", "normal") ||
@@ -1713,6 +1721,50 @@ func (s *Service) Disable(ctx context.Context, id uint64, reason string) error {
 		_ = s.sticky.DeleteByAccount(ctx, id)
 	}
 	return nil
+}
+
+// HandleChatForbidden 处理聊天上游 403：
+//   - 首次：24h 临时封禁（LastError=403:…，CooldownUntil=+24h），到期自动回池
+//   - 24h 放回后再 403：永久停用（enabled=false，LastError=403-disabled:…）
+// 返回 permanent=true 表示已永久停用。
+func (s *Service) HandleChatForbidden(ctx context.Context, credential accountdomain.Credential, detail string) (permanent bool, err error) {
+	now := s.now()
+	detail = strings.TrimSpace(detail)
+	if detail == "" {
+		detail = "上游拒绝了该请求"
+	}
+	// 已在 403 临时封禁窗口内：只保证冷却与标记，不升级为永久停用。
+	if accountdomain.IsActiveChatForbiddenCooldown(credential.LastError, credential.CooldownUntil, now) {
+		until := *credential.CooldownUntil
+		if err := s.accounts.UpdateHealth(ctx, credential.ID, max(1, credential.FailureCount), &until, credential.LastError, false); err != nil {
+			return false, mapRepositoryError(err)
+		}
+		if s.sticky != nil {
+			_ = s.sticky.DeleteByAccount(ctx, credential.ID)
+		}
+		return false, nil
+	}
+	// 24h 放回后（标记仍在）再次 403：永久停用。
+	if accountdomain.IsRecoveredChatForbiddenProbe(credential.LastError, credential.CooldownUntil, now) {
+		reason := accountdomain.ChatForbiddenDisabledPrefix + detail
+		if err := s.Disable(ctx, credential.ID, reason); err != nil {
+			return true, err
+		}
+		return true, nil
+	}
+	// 首次 403：24h 临时封禁。
+	until := now.Add(accountdomain.ChatForbiddenCooldown)
+	reason := accountdomain.ChatForbiddenSuspendPrefix + detail
+	if len(reason) > 512 {
+		reason = reason[:512]
+	}
+	if err := s.accounts.UpdateHealth(ctx, credential.ID, max(1, credential.FailureCount+1), &until, reason, false); err != nil {
+		return false, mapRepositoryError(err)
+	}
+	if s.sticky != nil {
+		_ = s.sticky.DeleteByAccount(ctx, credential.ID)
+	}
+	return false, nil
 }
 
 // markSSOCredentialRejected 在上游明确返回 401 后可靠持久化失效状态。

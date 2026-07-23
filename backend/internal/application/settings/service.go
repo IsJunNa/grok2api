@@ -123,10 +123,15 @@ type ClientKeyDefaultsConfig struct {
 
 // AccountsConfig 是管理接口使用的账号池维护策略输入。
 type AccountsConfig struct {
-	AutoCleanReauthEnabled   bool
-	AutoCleanReauthInterval  string
-	AutoCleanReauthMinAge    string
-	AutoCleanIncludeDisabled bool
+	AutoCleanReauthEnabled      bool
+	AutoCleanReauthInterval     string
+	AutoCleanReauthMinAge       string
+	AutoCleanIncludeDisabled    bool
+	ForbiddenProbeEnabled       bool
+	ForbiddenProbeInterval      string
+	ForbiddenProbeConcurrency   int
+	ForbiddenProbeBatchSize     int
+	ForbiddenProbeSkipSuspended bool
 }
 
 // EditableConfig 聚合管理端允许修改的运行参数。
@@ -384,6 +389,22 @@ func applyDomainConfig(base config.Config, value settingsdomain.Config) config.C
 	}
 	base.Accounts.AutoCleanReauthEnabled = value.Accounts.AutoCleanReauthEnabled
 	base.Accounts.AutoCleanIncludeDisabled = value.Accounts.AutoCleanIncludeDisabled
+	if value.Accounts.ForbiddenProbeInterval > 0 {
+		base.Accounts.ForbiddenProbeInterval = config.Duration(value.Accounts.ForbiddenProbeInterval)
+	}
+	if value.Accounts.ForbiddenProbeConcurrency > 0 {
+		base.Accounts.ForbiddenProbeConcurrency = value.Accounts.ForbiddenProbeConcurrency
+	}
+	if value.Accounts.ForbiddenProbeBatchSize > 0 {
+		base.Accounts.ForbiddenProbeBatchSize = value.Accounts.ForbiddenProbeBatchSize
+	}
+	// 旧 payload 无 ForbiddenProbe 字段时保持默认 false / true；新字段通过非零并发/批次识别是否曾写入。
+	// Enabled / SkipSuspended 直接覆盖（零值即关闭/false）。
+	base.Accounts.ForbiddenProbeEnabled = value.Accounts.ForbiddenProbeEnabled
+	// SkipSuspended 默认 true；仅当并发或批次曾配置时才采用持久化布尔值，否则保留默认。
+	if value.Accounts.ForbiddenProbeConcurrency > 0 || value.Accounts.ForbiddenProbeBatchSize > 0 || value.Accounts.ForbiddenProbeInterval > 0 || value.Accounts.ForbiddenProbeEnabled {
+		base.Accounts.ForbiddenProbeSkipSuspended = value.Accounts.ForbiddenProbeSkipSuspended
+	}
 	return base
 }
 
@@ -439,10 +460,15 @@ func toDomainConfig(value config.Config) settingsdomain.Config {
 			RPMLimit: value.ClientKeyDefaults.RPMLimit, MaxConcurrent: value.ClientKeyDefaults.MaxConcurrent,
 		},
 		Accounts: settingsdomain.AccountsConfig{
-			AutoCleanReauthEnabled:   value.Accounts.AutoCleanReauthEnabled,
-			AutoCleanReauthInterval:  value.Accounts.AutoCleanReauthInterval.Value(),
-			AutoCleanReauthMinAge:    value.Accounts.AutoCleanReauthMinAge.Value(),
-			AutoCleanIncludeDisabled: value.Accounts.AutoCleanIncludeDisabled,
+			AutoCleanReauthEnabled:      value.Accounts.AutoCleanReauthEnabled,
+			AutoCleanReauthInterval:     value.Accounts.AutoCleanReauthInterval.Value(),
+			AutoCleanReauthMinAge:       value.Accounts.AutoCleanReauthMinAge.Value(),
+			AutoCleanIncludeDisabled:    value.Accounts.AutoCleanIncludeDisabled,
+			ForbiddenProbeEnabled:       value.Accounts.ForbiddenProbeEnabled,
+			ForbiddenProbeInterval:      value.Accounts.ForbiddenProbeInterval.Value(),
+			ForbiddenProbeConcurrency:   value.Accounts.ForbiddenProbeConcurrency,
+			ForbiddenProbeBatchSize:     value.Accounts.ForbiddenProbeBatchSize,
+			ForbiddenProbeSkipSuspended: value.Accounts.ForbiddenProbeSkipSuspended,
 		},
 	}
 }
@@ -521,6 +547,14 @@ func mergeEditable(current config.Config, input EditableConfig) (config.Config, 
 	if input.AccountsProvided {
 		next.Accounts.AutoCleanReauthEnabled = input.Accounts.AutoCleanReauthEnabled
 		next.Accounts.AutoCleanIncludeDisabled = input.Accounts.AutoCleanIncludeDisabled
+		next.Accounts.ForbiddenProbeEnabled = input.Accounts.ForbiddenProbeEnabled
+		if input.Accounts.ForbiddenProbeConcurrency > 0 {
+			next.Accounts.ForbiddenProbeConcurrency = input.Accounts.ForbiddenProbeConcurrency
+		}
+		if input.Accounts.ForbiddenProbeBatchSize > 0 {
+			next.Accounts.ForbiddenProbeBatchSize = input.Accounts.ForbiddenProbeBatchSize
+		}
+		next.Accounts.ForbiddenProbeSkipSuspended = input.Accounts.ForbiddenProbeSkipSuspended
 	}
 
 	type durationInput struct {
@@ -558,6 +592,11 @@ func mergeEditable(current config.Config, input EditableConfig) (config.Config, 
 			durationInput{"accounts.autoCleanReauthInterval", input.Accounts.AutoCleanReauthInterval, func(value config.Duration) { next.Accounts.AutoCleanReauthInterval = value }},
 			durationInput{"accounts.autoCleanReauthMinAge", input.Accounts.AutoCleanReauthMinAge, func(value config.Duration) { next.Accounts.AutoCleanReauthMinAge = value }},
 		)
+		if strings.TrimSpace(input.Accounts.ForbiddenProbeInterval) != "" {
+			durations = append(durations,
+				durationInput{"accounts.forbiddenProbeInterval", input.Accounts.ForbiddenProbeInterval, func(value config.Duration) { next.Accounts.ForbiddenProbeInterval = value }},
+			)
+		}
 	}
 	for _, item := range durations {
 		value, err := time.ParseDuration(strings.TrimSpace(item.value))
@@ -622,10 +661,15 @@ func toEditable(cfg config.Config) EditableConfig {
 		},
 		ClientKeyDefaults: ClientKeyDefaultsConfig{RPMLimit: cfg.ClientKeyDefaults.RPMLimit, MaxConcurrent: cfg.ClientKeyDefaults.MaxConcurrent},
 		Accounts: AccountsConfig{
-			AutoCleanReauthEnabled:   cfg.Accounts.AutoCleanReauthEnabled,
-			AutoCleanReauthInterval:  cfg.Accounts.AutoCleanReauthInterval.String(),
-			AutoCleanReauthMinAge:    cfg.Accounts.AutoCleanReauthMinAge.String(),
-			AutoCleanIncludeDisabled: cfg.Accounts.AutoCleanIncludeDisabled,
+			AutoCleanReauthEnabled:      cfg.Accounts.AutoCleanReauthEnabled,
+			AutoCleanReauthInterval:     cfg.Accounts.AutoCleanReauthInterval.String(),
+			AutoCleanReauthMinAge:       cfg.Accounts.AutoCleanReauthMinAge.String(),
+			AutoCleanIncludeDisabled:    cfg.Accounts.AutoCleanIncludeDisabled,
+			ForbiddenProbeEnabled:       cfg.Accounts.ForbiddenProbeEnabled,
+			ForbiddenProbeInterval:      cfg.Accounts.ForbiddenProbeInterval.String(),
+			ForbiddenProbeConcurrency:   cfg.Accounts.ForbiddenProbeConcurrency,
+			ForbiddenProbeBatchSize:     cfg.Accounts.ForbiddenProbeBatchSize,
+			ForbiddenProbeSkipSuspended: cfg.Accounts.ForbiddenProbeSkipSuspended,
 		},
 		AccountsProvided: true,
 	}

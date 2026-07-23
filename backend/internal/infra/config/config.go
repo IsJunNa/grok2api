@@ -232,10 +232,15 @@ type ClientKeyDefaultsConfig struct {
 
 // AccountsConfig 定义可热加载的账号池维护策略；默认全部关闭。
 type AccountsConfig struct {
-	AutoCleanReauthEnabled   bool
-	AutoCleanReauthInterval  Duration
-	AutoCleanReauthMinAge    Duration
-	AutoCleanIncludeDisabled bool
+	AutoCleanReauthEnabled      bool
+	AutoCleanReauthInterval     Duration
+	AutoCleanReauthMinAge       Duration
+	AutoCleanIncludeDisabled    bool
+	ForbiddenProbeEnabled       bool
+	ForbiddenProbeInterval      Duration
+	ForbiddenProbeConcurrency   int
+	ForbiddenProbeBatchSize     int
+	ForbiddenProbeSkipSuspended bool
 }
 
 type Secrets struct {
@@ -564,6 +569,15 @@ func (c Config) Validate() error {
 	if c.Accounts.AutoCleanReauthMinAge.Value() < time.Minute || c.Accounts.AutoCleanReauthMinAge.Value() > 30*24*time.Hour {
 		return errors.New("accounts.autoCleanReauthMinAge 必须在 1 分钟到 30 天之间")
 	}
+	if c.Accounts.ForbiddenProbeInterval.Value() < time.Hour || c.Accounts.ForbiddenProbeInterval.Value() > 24*time.Hour {
+		return errors.New("accounts.forbiddenProbeInterval 必须在 1 小时到 24 小时之间")
+	}
+	if c.Accounts.ForbiddenProbeConcurrency < 1 || c.Accounts.ForbiddenProbeConcurrency > 20 {
+		return errors.New("accounts.forbiddenProbeConcurrency 必须在 1 到 20 之间")
+	}
+	if c.Accounts.ForbiddenProbeBatchSize < 10 || c.Accounts.ForbiddenProbeBatchSize > 1000 {
+		return errors.New("accounts.forbiddenProbeBatchSize 必须在 10 到 1000 之间")
+	}
 	return nil
 }
 
@@ -667,10 +681,15 @@ func defaultConfig() Config {
 		},
 		ClientKeyDefaults: ClientKeyDefaultsConfig{RPMLimit: clientkeydomain.DefaultRPMLimit, MaxConcurrent: clientkeydomain.DefaultMaxConcurrent},
 		Accounts: AccountsConfig{
-			AutoCleanReauthEnabled:   false,
-			AutoCleanReauthInterval:  Duration(10 * time.Minute),
-			AutoCleanReauthMinAge:    Duration(time.Hour),
-			AutoCleanIncludeDisabled: false,
+			AutoCleanReauthEnabled:      false,
+			AutoCleanReauthInterval:     Duration(10 * time.Minute),
+			AutoCleanReauthMinAge:       Duration(time.Hour),
+			AutoCleanIncludeDisabled:    false,
+			ForbiddenProbeEnabled:       false,
+			ForbiddenProbeInterval:      Duration(6 * time.Hour),
+			ForbiddenProbeConcurrency:   5,
+			ForbiddenProbeBatchSize:     100,
+			ForbiddenProbeSkipSuspended: true,
 		},
 	}
 }

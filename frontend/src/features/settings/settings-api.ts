@@ -30,6 +30,11 @@ export type SettingsConfigDTO = {
     autoCleanReauthInterval: string;
     autoCleanReauthMinAge: string;
     autoCleanIncludeDisabled: boolean;
+    forbiddenProbeEnabled: boolean;
+    forbiddenProbeInterval: string;
+    forbiddenProbeConcurrency: number;
+    forbiddenProbeBatchSize: number;
+    forbiddenProbeSkipSuspended: boolean;
   };
 };
 
@@ -102,6 +107,11 @@ const settingsConfigValidator = hasShape({
     autoCleanReauthInterval: isString,
     autoCleanReauthMinAge: isString,
     autoCleanIncludeDisabled: isBoolean,
+    forbiddenProbeEnabled: isOptional(isBoolean),
+    forbiddenProbeInterval: isOptional(isString),
+    forbiddenProbeConcurrency: isOptional(isNumber),
+    forbiddenProbeBatchSize: isOptional(isNumber),
+    forbiddenProbeSkipSuspended: isOptional(isBoolean),
   })),
 });
 const defaultAccountsConfig = (): SettingsConfigDTO["accounts"] => ({
@@ -109,6 +119,11 @@ const defaultAccountsConfig = (): SettingsConfigDTO["accounts"] => ({
   autoCleanReauthInterval: "10m",
   autoCleanReauthMinAge: "1h",
   autoCleanIncludeDisabled: false,
+  forbiddenProbeEnabled: false,
+  forbiddenProbeInterval: "6h",
+  forbiddenProbeConcurrency: 5,
+  forbiddenProbeBatchSize: 100,
+  forbiddenProbeSkipSuspended: true,
 });
 function withSettingsDefaults(snapshot: SettingsSnapshotDTO): SettingsSnapshotDTO {
   const accounts = snapshot.config.accounts ?? defaultAccountsConfig();
@@ -134,6 +149,11 @@ function withSettingsDefaults(snapshot: SettingsSnapshotDTO): SettingsSnapshotDT
         autoCleanReauthInterval: accounts.autoCleanReauthInterval || "10m",
         autoCleanReauthMinAge: accounts.autoCleanReauthMinAge || "1h",
         autoCleanIncludeDisabled: accounts.autoCleanIncludeDisabled ?? false,
+        forbiddenProbeEnabled: accounts.forbiddenProbeEnabled ?? false,
+        forbiddenProbeInterval: accounts.forbiddenProbeInterval || "6h",
+        forbiddenProbeConcurrency: accounts.forbiddenProbeConcurrency || 5,
+        forbiddenProbeBatchSize: accounts.forbiddenProbeBatchSize || 100,
+        forbiddenProbeSkipSuspended: accounts.forbiddenProbeSkipSuspended ?? true,
       },
     },
   };

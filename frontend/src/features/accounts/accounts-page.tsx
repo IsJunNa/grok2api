@@ -47,6 +47,8 @@ import {
   importConsoleAccounts,
   importWebAccounts,
   listAccounts,
+  probeAccountsForbidden,
+  probeAllAccountsForbidden,
   pollDeviceAuthorization,
   refreshAccountBilling,
   refreshAccountsQuota,
@@ -141,6 +143,8 @@ export function AccountsPage() {
   const [webAccountScriptsProgress, setWebAccountScriptsProgress] = useState<AccountTaskProgressDTO | null>(null);
   const [renewAllOpen, setRenewAllOpen] = useState(false);
   const [renewalProgress, setRenewalProgress] = useState<AccountTaskProgressDTO | null>(null);
+  const [forbiddenProbeOpen, setForbiddenProbeOpen] = useState(false);
+  const [forbiddenProbeBatchOpen, setForbiddenProbeBatchOpen] = useState(false);
   const [editing, setEditing] = useState<AccountDTO | null>(null);
   const [deleting, setDeleting] = useState<AccountDTO | null>(null);
   const [deviceOpen, setDeviceOpen] = useState(false);
@@ -488,6 +492,27 @@ export function AccountsPage() {
     onError: showError,
   });
 
+  const forbiddenProbeMutation = useMutation({
+    mutationFn: () => probeAllAccountsForbidden(provider),
+    onSuccess: (result) => {
+      setForbiddenProbeOpen(false);
+      invalidateAccountData();
+      toast.success(t("accounts.forbiddenProbeCompleted", result));
+    },
+    onError: showError,
+  });
+
+  const forbiddenProbeBatchMutation = useMutation({
+    mutationFn: () => probeAccountsForbidden([...selected], provider),
+    onSuccess: (result) => {
+      clearSelection();
+      setForbiddenProbeBatchOpen(false);
+      invalidateAccountData();
+      toast.success(t("accounts.forbiddenProbeCompleted", result));
+    },
+    onError: showError,
+  });
+
   const bindEgressMutation = useMutation({
     mutationFn: () => {
       if (!egressNodeID) throw new Error(t("accounts.bindEgressEmpty"));
@@ -731,6 +756,8 @@ export function AccountsPage() {
     || batchBillingMutation.isPending
     || batchTokenMutation.isPending
     || batchDeleteMutation.isPending
+    || forbiddenProbeMutation.isPending
+    || forbiddenProbeBatchMutation.isPending
     || bindEgressMutation.isPending
     || unbindEgressMutation.isPending
     || cleanupMutation.isPending
@@ -833,6 +860,7 @@ export function AccountsPage() {
                   { value: "disabled", label: t("accounts.statusDisabled") },
                   { value: "reauthRequired", label: t("accounts.statusReauthRequired") },
                   { value: "cooldown", label: t("accounts.statusCooldown") },
+                  { value: "forbidden", label: t("accounts.statusForbidden") },
                   { value: "waitingReset", label: t("accounts.waitingReset") },
                   { value: "probing", label: t("accounts.probing") },
                 ] },
@@ -875,6 +903,7 @@ export function AccountsPage() {
                 <Button variant="secondary" size="sm" disabled={bulkTaskPending} onClick={() => unbindEgressMutation.mutate()}><Unlink />{t("accounts.unbindEgress")}</Button>
                 {provider === "grok_web" ? <Button variant="secondary" size="sm" disabled={bulkTaskPending} onClick={() => openWebConversion([...selected])}>{t("accountConversion.action")}</Button> : null}
                 {provider === "grok_web" ? <Button variant="secondary" size="sm" disabled={bulkTaskPending} onClick={() => setWebAccountScriptsTargets([...selected])}>{t("webAccountScripts.action")}</Button> : null}
+                <Button variant="secondary" size="sm" disabled={bulkTaskPending} onClick={() => setForbiddenProbeBatchOpen(true)}>{t("accounts.forbiddenProbeAction")}</Button>
                 <Button variant="secondary" size="sm" disabled={bulkTaskPending} onClick={() => batchBillingMutation.mutate()}>{t("accountCredential.quotaSyncAction")}</Button>
                 {provider === "grok_build" ? <Button variant="secondary" size="sm" disabled={bulkTaskPending} onClick={() => batchTokenMutation.mutate()}>{t("accountCredential.refreshAction")}</Button> : null}
                 <Button variant="secondary" size="sm" className="bg-destructive/10 text-destructive hover:bg-destructive/15 hover:text-destructive" disabled={bulkTaskPending} onClick={() => setBatchDeleteOpen(true)}>{t("common.delete")}</Button>
@@ -883,6 +912,7 @@ export function AccountsPage() {
               <div className="flex flex-wrap items-center justify-end gap-1.5">
                 {provider === "grok_web" && hasProviderAccounts ? <Button variant="secondary" size="sm" disabled={bulkTaskPending} onClick={() => openWebConversion("all")}>{t("accountConversion.action")}</Button> : null}
                 {provider === "grok_web" && hasProviderAccounts ? <Button variant="secondary" size="sm" disabled={bulkTaskPending} onClick={() => setWebAccountScriptsTargets("all")}>{t("webAccountScripts.action")}</Button> : null}
+                {hasProviderAccounts ? <Button variant="secondary" size="sm" disabled={bulkTaskPending} onClick={() => setForbiddenProbeOpen(true)}>{t("accounts.forbiddenProbeAction")}</Button> : null}
                 {hasProviderAccounts ? <Button variant="secondary" size="sm" disabled={bulkTaskPending} onClick={() => setSyncAllOpen(true)}>{t("accountCredential.quotaSyncAction")}</Button> : null}
                 {hasProviderAccounts && provider === "grok_build" ? <Button variant="secondary" size="sm" disabled={bulkTaskPending} onClick={() => setRenewAllOpen(true)}>{t("accountCredential.refreshAction")}</Button> : null}
                 {hasProviderAccounts ? <Button variant="secondary" size="sm" className="bg-destructive/10 text-destructive hover:bg-destructive/15 hover:text-destructive" disabled={bulkTaskPending} onClick={() => { setCleanupStatuses(new Set()); setCleanupOpen(true); }}><Trash2 />{t("accounts.cleanupAction")}</Button> : null}
@@ -989,6 +1019,36 @@ export function AccountsPage() {
           onRun={runSelectedWebAccountScripts}
         />
       ) : null}
+
+      <AlertDialog open={forbiddenProbeOpen} onOpenChange={setForbiddenProbeOpen}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>{t("accounts.forbiddenProbeTitle")}</AlertDialogTitle>
+            <AlertDialogDescription>{t("accounts.forbiddenProbeDescription")}</AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>{t("common.cancel")}</AlertDialogCancel>
+            <AlertDialogAction disabled={forbiddenProbeMutation.isPending} onClick={(event) => { event.preventDefault(); forbiddenProbeMutation.mutate(); }}>
+              {forbiddenProbeMutation.isPending ? <><Spinner />{t("common.loading")}</> : t("accounts.forbiddenProbeStart")}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+
+      <AlertDialog open={forbiddenProbeBatchOpen} onOpenChange={setForbiddenProbeBatchOpen}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>{t("accounts.forbiddenProbeBatchTitle", { count: selected.size })}</AlertDialogTitle>
+            <AlertDialogDescription>{t("accounts.forbiddenProbeBatchDescription", { count: selected.size })}</AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>{t("common.cancel")}</AlertDialogCancel>
+            <AlertDialogAction disabled={forbiddenProbeBatchMutation.isPending} onClick={(event) => { event.preventDefault(); forbiddenProbeBatchMutation.mutate(); }}>
+              {forbiddenProbeBatchMutation.isPending ? <><Spinner />{t("common.loading")}</> : t("accounts.forbiddenProbeStart")}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
 
       <AlertDialog open={syncAllOpen} onOpenChange={(open) => { if (!open) quotaSyncAbortRef.current?.abort(); setSyncAllOpen(open); }}>
         <AlertDialogContent>
@@ -1331,13 +1391,38 @@ function AccountTypeText({ label, title, variant }: { label: string; title?: str
   return <span title={title ?? label} className={cn("max-w-32 truncate text-xs font-medium", variant === "free" ? "text-emerald-700 dark:text-emerald-300" : "text-primary")}>{label}</span>;
 }
 
+function isChatForbiddenSuspend(lastError?: string) {
+  const value = (lastError ?? "").trim();
+  return value.startsWith("403:") && !value.startsWith("403-disabled:");
+}
+
+function isChatForbiddenDisabled(lastError?: string) {
+  return (lastError ?? "").trim().startsWith("403-disabled:");
+}
+
 function AccountStatus({ account }: { account: AccountDTO }) {
   const { t, i18n } = useTranslation();
   if (!account.enabled) {
+    if (isChatForbiddenDisabled(account.lastError)) {
+      const detail = account.lastError?.replace(/^403-disabled:\s*/, "") || t("accounts.statusForbiddenDisabledHelp");
+      return (
+        <StatusTooltip content={detail}>
+          <Badge variant="destructive">{t("accounts.statusForbidden")}</Badge>
+        </StatusTooltip>
+      );
+    }
     return <Badge variant="outline" className="text-muted-foreground">{t("accounts.statusDisabled")}</Badge>;
   }
   if (account.authStatus === "reauthRequired") {
     return <Badge variant="destructive">{t("accounts.statusReauthRequired")}</Badge>;
+  }
+  if (isChatForbiddenSuspend(account.lastError) && account.cooldownUntil && new Date(account.cooldownUntil) > new Date()) {
+    const detail = t("accounts.statusForbiddenUntil", { time: formatDateTime(account.cooldownUntil, i18n.language) });
+    return (
+      <StatusTooltip content={detail}>
+        <Badge variant="secondary" className="bg-rose-500/10 text-rose-700 dark:text-rose-300">{t("accounts.statusForbidden")}</Badge>
+      </StatusTooltip>
+    );
   }
   const consoleWindow = account.provider === "grok_console"
     ? account.quotaWindows?.find((window) => window.mode === "console" && window.remaining <= 0)

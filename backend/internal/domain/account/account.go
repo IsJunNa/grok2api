@@ -110,6 +110,56 @@ const (
 	AuthStatusReauthRequired AuthStatus = "reauthRequired"
 )
 
+// 聊天上游 403 的账号健康标记（写入 LastError，避免额外 schema）。
+const (
+	// ChatForbiddenSuspendPrefix 表示 24h 临时封禁；到期后无需任务即可回到号池。
+	ChatForbiddenSuspendPrefix = "403:"
+	// ChatForbiddenDisabledPrefix 表示恢复后再 403 后的永久停用。
+	ChatForbiddenDisabledPrefix = "403-disabled:"
+	// ChatForbiddenCooldown 是首次聊天 403 的默认隔离时长。
+	ChatForbiddenCooldown = 24 * time.Hour
+)
+
+// IsChatForbiddenSuspend 判断账号是否处于（或刚结束的）聊天 403 临时封禁标记。
+// 注意 403-disabled: 也以 403: 开头，必须先排除永久停用前缀。
+func IsChatForbiddenSuspend(lastError string) bool {
+	value := strings.TrimSpace(lastError)
+	if strings.HasPrefix(value, ChatForbiddenDisabledPrefix) {
+		return false
+	}
+	return strings.HasPrefix(value, ChatForbiddenSuspendPrefix)
+}
+
+// IsChatForbiddenDisabled 判断账号是否因聊天 403 二次失败被永久停用。
+func IsChatForbiddenDisabled(lastError string) bool {
+	return strings.HasPrefix(strings.TrimSpace(lastError), ChatForbiddenDisabledPrefix)
+}
+
+// IsChatForbiddenMarked 判断 LastError 是否为任一聊天 403 标记。
+func IsChatForbiddenMarked(lastError string) bool {
+	return IsChatForbiddenSuspend(lastError) || IsChatForbiddenDisabled(lastError)
+}
+
+// IsActiveChatForbiddenCooldown 判断账号当前是否仍在 403 临时封禁窗口内。
+func IsActiveChatForbiddenCooldown(lastError string, cooldownUntil *time.Time, now time.Time) bool {
+	if !IsChatForbiddenSuspend(lastError) || cooldownUntil == nil {
+		return false
+	}
+	return now.Before(cooldownUntil.UTC())
+}
+
+// IsRecoveredChatForbiddenProbe 表示账号曾因 403 被封 24h，窗口已过且未成功清理标记，
+// 再次 403 时应永久停用。
+func IsRecoveredChatForbiddenProbe(lastError string, cooldownUntil *time.Time, now time.Time) bool {
+	if !IsChatForbiddenSuspend(lastError) {
+		return false
+	}
+	if cooldownUntil != nil && now.Before(cooldownUntil.UTC()) {
+		return false
+	}
+	return true
+}
+
 // EgressAssignmentMode 表示账号出口节点的维护方式。手工绑定绝不会被
 // 自动均衡任务迁移，自动绑定才允许在健康或容量变化时重新分配。
 type EgressAssignmentMode string
@@ -150,10 +200,13 @@ type Credential struct {
 	Priority         int
 	MaxConcurrent    int
 	MinimumRemaining float64
-	FailureCount     int
-	CooldownUntil    *time.Time
-	LastError        string
-	LastUsedAt       *time.Time
+	FailureCount  int
+	CooldownUntil *time.Time
+	// LastError 记录最近一次账号级故障说明。聊天 403 使用固定前缀：
+	//   "403:" 临时封禁（配合 CooldownUntil，到期自动回到号池）
+	//   "403-disabled:" 恢复后再失败后的永久停用
+	LastError  string
+	LastUsedAt *time.Time
 	ObservedModel    string
 	ObservedModelAt  *time.Time
 	WebTier          WebTier

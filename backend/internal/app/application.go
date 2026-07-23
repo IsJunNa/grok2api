@@ -241,6 +241,7 @@ func New(ctx context.Context, cfg config.Config, logger *slog.Logger) (*Applicat
 	cliAdapter.SetFallbackMarker(accountService)
 	accountService.SetLogger(logger)
 	accountService.UpdateAutoCleanConfig(accountAutoCleanConfig(cfg.Accounts))
+	accountService.UpdateForbiddenProbeConfig(accountForbiddenProbeConfig(cfg.Accounts))
 	accountService.SetConcurrencyLimiter(concurrency)
 	accountService.SetQuotaRecoveryQueue(quotaQueue)
 	accountService.SetQuotaRefreshCoordinator(quotaRefreshState)
@@ -352,6 +353,7 @@ func New(ctx context.Context, cfg config.Config, logger *slog.Logger) (*Applicat
 		auditService.UpdateLedgerConfig(auditLedgerConfig(next.Audit))
 		clientKeyService.UpdateDefaults(next.ClientKeyDefaults.RPMLimit, next.ClientKeyDefaults.MaxConcurrent)
 		accountService.UpdateAutoCleanConfig(accountAutoCleanConfig(next.Accounts))
+		accountService.UpdateForbiddenProbeConfig(accountForbiddenProbeConfig(next.Accounts))
 	})
 	updateService := updatecheckapp.NewService(buildinfo.CurrentVersion(), nil)
 
@@ -412,6 +414,16 @@ func accountAutoCleanConfig(value config.AccountsConfig) accountapp.AutoCleanCon
 		Interval:        value.AutoCleanReauthInterval.Value(),
 		MinAge:          value.AutoCleanReauthMinAge.Value(),
 		IncludeDisabled: value.AutoCleanIncludeDisabled,
+	}
+}
+
+func accountForbiddenProbeConfig(value config.AccountsConfig) accountapp.ForbiddenProbeConfig {
+	return accountapp.ForbiddenProbeConfig{
+		Enabled:       value.ForbiddenProbeEnabled,
+		Interval:      value.ForbiddenProbeInterval.Value(),
+		Concurrency:   value.ForbiddenProbeConcurrency,
+		BatchSize:     value.ForbiddenProbeBatchSize,
+		SkipSuspended: value.ForbiddenProbeSkipSuspended,
 	}
 }
 
@@ -520,6 +532,10 @@ func (a *Application) Run(ctx context.Context) error {
 	})
 	startBackground("account_auto_clean", func(taskCtx context.Context) error {
 		a.accounts.RunAccountAutoClean(taskCtx)
+		return nil
+	})
+	startBackground("account_forbidden_probe", func(taskCtx context.Context) error {
+		a.accounts.RunForbiddenProbe(taskCtx)
 		return nil
 	})
 	startBackground("statsig_warmup", func(taskCtx context.Context) error {

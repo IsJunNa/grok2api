@@ -128,4 +128,14 @@ type AccountsConfig struct {
 	AutoCleanReauthMinAge time.Duration
 	// AutoCleanIncludeDisabled 为 true 时，reauth 清理时包含 enabled=false 的账号。
 	AutoCleanIncludeDisabled bool
+	// ForbiddenProbeEnabled 为 true 时，周期性对启用账号发起真实聊天探测以标记 403。
+	ForbiddenProbeEnabled bool
+	// ForbiddenProbeInterval 自动 403 探测间隔。
+	ForbiddenProbeInterval time.Duration
+	// ForbiddenProbeConcurrency 自动/手动探测时的并发账号数。
+	ForbiddenProbeConcurrency int
+	// ForbiddenProbeBatchSize 单次自动扫描最多探测的账号数。
+	ForbiddenProbeBatchSize int
+	// ForbiddenProbeSkipSuspended 为 true 时跳过仍在 403 临时封禁窗口内的账号。
+	ForbiddenProbeSkipSuspended bool
 }

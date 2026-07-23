@@ -185,7 +185,15 @@ func isAccountScopedForbidden(text string) bool {
 }
 
 func isPermanentAccountDenial(text string) bool {
+	// xAI Build / SuperGrok 常见聊天拒绝：注册机 bot_flag、试用号、权限未开通等。
+	// 社区观察多数 24h 后可恢复，网关侧按账号 24h 封禁而非永久 reauth。
 	if strings.Contains(text, "access to the chat endpoint is denied") {
+		return true
+	}
+	if strings.Contains(text, "please ensure you're using the correct credentials") || strings.Contains(text, "please ensure you are using the correct credentials") {
+		return true
+	}
+	if strings.Contains(text, "update the permissions") && strings.Contains(text, "console.x.ai") {
 		return true
 	}
 	return strings.Trim(strings.TrimSpace(text), " .!\t\r\n") == "access denied"

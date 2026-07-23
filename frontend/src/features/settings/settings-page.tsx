@@ -25,6 +25,7 @@ export function SettingsPage() {
   const { form, settingsQuery, updateMutation, reset } = useSettings();
   const [autoCleanConfirm, setAutoCleanConfirm] = useState<"enabled" | "includeDisabled" | null>(null);
   const autoCleanEnabled = form.watch("accounts.autoCleanReauthEnabled") === true;
+  const forbiddenProbeEnabled = form.watch("accounts.forbiddenProbeEnabled") === true;
   const segmentedSelectorEnabled = form.watch("routing.segmentedSelector.enabled") === true;
 
   if (settingsQuery.isError) {
@@ -301,6 +302,36 @@ export function SettingsPage() {
                 </AlertDialogFooter>
               </AlertDialogContent>
             </AlertDialog>
+          </SettingsSection>
+
+          <SettingsSection title={t("settings.accounts.forbiddenProbeTitle")}>
+            <div className="space-y-0">
+              <SettingsField controlId="accounts-forbidden-probe-enabled" label={t("settings.accounts.forbiddenProbeEnabled")} description={t("settings.accounts.forbiddenProbeEnabledHelp")}>
+                <Controller control={form.control} name="accounts.forbiddenProbeEnabled" render={({ field }) => (
+                  <div className="flex h-9 items-center">
+                    <Switch id="accounts-forbidden-probe-enabled" checked={Boolean(field.value)} onCheckedChange={field.onChange} />
+                  </div>
+                )} />
+              </SettingsField>
+              <SettingsField controlId="accounts-forbidden-probe-interval" label={t("settings.accounts.forbiddenProbeInterval")} description={t("settings.accounts.forbiddenProbeIntervalHelp")} error={form.formState.errors.accounts?.forbiddenProbeInterval?.message}>
+                <Controller control={form.control} name="accounts.forbiddenProbeInterval" render={({ field }) => (
+                  <DurationInput id="accounts-forbidden-probe-interval" value={field.value} onChange={field.onChange} disabled={!forbiddenProbeEnabled} />
+                )} />
+              </SettingsField>
+              <SettingsField controlId="accounts-forbidden-probe-concurrency" label={t("settings.accounts.forbiddenProbeConcurrency")} description={t("settings.accounts.forbiddenProbeConcurrencyHelp")} error={form.formState.errors.accounts?.forbiddenProbeConcurrency?.message}>
+                <Input id="accounts-forbidden-probe-concurrency" type="number" min={1} max={20} disabled={!forbiddenProbeEnabled} {...form.register("accounts.forbiddenProbeConcurrency", { valueAsNumber: true })} />
+              </SettingsField>
+              <SettingsField controlId="accounts-forbidden-probe-batch-size" label={t("settings.accounts.forbiddenProbeBatchSize")} description={t("settings.accounts.forbiddenProbeBatchSizeHelp")} error={form.formState.errors.accounts?.forbiddenProbeBatchSize?.message}>
+                <Input id="accounts-forbidden-probe-batch-size" type="number" min={10} max={1000} disabled={!forbiddenProbeEnabled} {...form.register("accounts.forbiddenProbeBatchSize", { valueAsNumber: true })} />
+              </SettingsField>
+              <SettingsField controlId="accounts-forbidden-probe-skip-suspended" label={t("settings.accounts.forbiddenProbeSkipSuspended")} description={t("settings.accounts.forbiddenProbeSkipSuspendedHelp")}>
+                <Controller control={form.control} name="accounts.forbiddenProbeSkipSuspended" render={({ field }) => (
+                  <div className="flex h-9 items-center">
+                    <Switch id="accounts-forbidden-probe-skip-suspended" checked={Boolean(field.value)} disabled={!forbiddenProbeEnabled} onCheckedChange={field.onChange} />
+                  </div>
+                )} />
+              </SettingsField>
+            </div>
           </SettingsSection>
 
           <SettingsSection title={t("settings.routing.title")}>

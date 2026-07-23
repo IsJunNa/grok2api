@@ -468,6 +468,30 @@ export function refreshAccountsTokens(ids: string[], provider: AccountProvider):
   return apiRequest("/api/admin/v1/accounts/batch/refresh-tokens", { method: "POST", body: { ids, provider } }, createObjectDecoder("account token refresh batch", { succeeded: isNumber, failed: isNumber, skipped: isNumber }));
 }
 
+export type ForbiddenProbeResultDTO = {
+  total: number;
+  probed: number;
+  ok: number;
+  forbidden: number;
+  failed: number;
+  skipped: number;
+  suspended: number;
+  disabled: number;
+};
+
+const decodeForbiddenProbeResult = createObjectDecoder("forbidden probe", {
+  total: isNumber, probed: isNumber, ok: isNumber, forbidden: isNumber,
+  failed: isNumber, skipped: isNumber, suspended: isNumber, disabled: isNumber,
+});
+
+export function probeAccountsForbidden(ids: string[], provider: AccountProvider): Promise<ForbiddenProbeResultDTO> {
+  return apiRequest("/api/admin/v1/accounts/batch/probe-forbidden", { method: "POST", body: { ids, provider } }, decodeForbiddenProbeResult);
+}
+
+export function probeAllAccountsForbidden(provider: AccountProvider): Promise<ForbiddenProbeResultDTO> {
+  return apiRequest("/api/admin/v1/accounts/probe-forbidden", { method: "POST", body: { provider } }, decodeForbiddenProbeResult);
+}
+
 export function cleanupAccounts(provider: AccountProvider, statuses: AccountCleanupStatus[]): Promise<{ deleted: number }> {
   return apiRequest("/api/admin/v1/accounts/cleanup", { method: "POST", body: { provider, statuses } }, decodeCountResult<{ deleted: number }>("deleted"));
 }
