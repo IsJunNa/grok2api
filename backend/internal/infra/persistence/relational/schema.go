@@ -47,6 +47,8 @@ var schemaModels = []any{
 	&mediaJobModel{},
 	&mediaAssetModel{},
 	&mediaUploadTicketModel{},
+	&forbiddenProbeRunModel{},
+	&forbiddenProbeRunItemModel{},
 	&runtimeSettingsModel{},
 }
 
@@ -96,6 +98,12 @@ var schemaIndexes = []string{
 	"CREATE INDEX IF NOT EXISTS idx_media_jobs_result_asset ON media_jobs(result_asset_id) WHERE result_asset_id <> ''",
 	// Pending input metadata rows only; keeps startup backfill scans off the full table after migration completes.
 	mediaJobInputMetadataPendingIndex,
+	"CREATE INDEX IF NOT EXISTS idx_forbidden_probe_runs_created_id ON forbidden_probe_runs(created_at DESC, id DESC)",
+	"CREATE INDEX IF NOT EXISTS idx_forbidden_probe_runs_provider_created ON forbidden_probe_runs(provider, created_at DESC, id DESC)",
+	"CREATE INDEX IF NOT EXISTS idx_forbidden_probe_runs_trigger_created ON forbidden_probe_runs(run_trigger, created_at DESC, id DESC)",
+	"CREATE INDEX IF NOT EXISTS idx_forbidden_probe_runs_state_created ON forbidden_probe_runs(state, created_at DESC, id DESC)",
+	"CREATE INDEX IF NOT EXISTS idx_forbidden_probe_run_items_run_created ON forbidden_probe_run_items(run_id, created_at DESC, id DESC)",
+	"CREATE INDEX IF NOT EXISTS idx_forbidden_probe_run_items_account ON forbidden_probe_run_items(account_id, created_at DESC)",
 }
 
 // InitializeSchema 以当前持久化模型作为首版数据库结构基线。

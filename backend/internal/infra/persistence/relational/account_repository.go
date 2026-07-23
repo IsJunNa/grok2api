@@ -182,7 +182,8 @@ func (r *AccountRepository) Summarize(ctx context.Context, now time.Time) ([]rep
 		SUM(CASE WHEN enabled = ? AND auth_status = ? AND NOT ` + accountRecoveryPredicate + ` AND NOT ` + providerQuotaExhaustedPredicate + ` AND cooldown_until > ? AND last_error NOT LIKE '403:%' THEN 1 ELSE 0 END) AS cooldown,
 		SUM(CASE WHEN enabled = ? AND auth_status = ? AND (EXISTS (SELECT 1 FROM account_quota_recovery recovery WHERE recovery.account_id = provider_accounts.id AND recovery.status = 'exhausted') OR ` + providerQuotaExhaustedPredicate + `) THEN 1 ELSE 0 END) AS waiting_reset,
 		SUM(CASE WHEN enabled = ? AND auth_status = ? AND EXISTS (SELECT 1 FROM account_quota_recovery recovery WHERE recovery.account_id = provider_accounts.id AND recovery.status = 'probing') THEN 1 ELSE 0 END) AS probing,
-		SUM(CASE WHEN enabled = ? THEN 1 ELSE 0 END) AS disabled,
+		SUM(CASE WHEN (enabled = ? AND auth_status = ? AND last_error LIKE '403:%' AND cooldown_until > ?) OR (enabled = ? AND last_error LIKE '403-disabled:%') THEN 1 ELSE 0 END) AS forbidden,
+		SUM(CASE WHEN enabled = ? AND last_error NOT LIKE '403-disabled:%' THEN 1 ELSE 0 END) AS disabled,
 		SUM(CASE WHEN enabled = ? AND auth_status = ? THEN 1 ELSE 0 END) AS reauth_required`
 	err := r.db.db.WithContext(ctx).Model(&accountModel{}).Select(
 		selectFields,
@@ -190,6 +191,7 @@ func (r *AccountRepository) Summarize(ctx context.Context, now time.Time) ([]rep
 		true, account.AuthStatusActive, now,
 		true, account.AuthStatusActive,
 		true, account.AuthStatusActive,
+		true, account.AuthStatusActive, now, false,
 		false,
 		true, account.AuthStatusReauthRequired,
 	).Group("provider").Scan(&rows).Error

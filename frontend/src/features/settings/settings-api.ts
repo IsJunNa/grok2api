@@ -35,6 +35,9 @@ export type SettingsConfigDTO = {
     forbiddenProbeConcurrency: number;
     forbiddenProbeBatchSize: number;
     forbiddenProbeSkipSuspended: boolean;
+    forbiddenReviewCooldown: string;
+    forbiddenReviewMaxHits: number;
+    forbiddenReviewFinalAction: "disabled" | "reauthRequired" | "delete";
   };
 };
 
@@ -112,6 +115,9 @@ const settingsConfigValidator = hasShape({
     forbiddenProbeConcurrency: isOptional(isNumber),
     forbiddenProbeBatchSize: isOptional(isNumber),
     forbiddenProbeSkipSuspended: isOptional(isBoolean),
+    forbiddenReviewCooldown: isOptional(isString),
+    forbiddenReviewMaxHits: isOptional(isNumber),
+    forbiddenReviewFinalAction: isOptional(isOneOf("disabled", "reauthRequired", "delete")),
   })),
 });
 const defaultAccountsConfig = (): SettingsConfigDTO["accounts"] => ({
@@ -124,6 +130,9 @@ const defaultAccountsConfig = (): SettingsConfigDTO["accounts"] => ({
   forbiddenProbeConcurrency: 5,
   forbiddenProbeBatchSize: 100,
   forbiddenProbeSkipSuspended: true,
+  forbiddenReviewCooldown: "24h",
+  forbiddenReviewMaxHits: 2,
+  forbiddenReviewFinalAction: "disabled",
 });
 function withSettingsDefaults(snapshot: SettingsSnapshotDTO): SettingsSnapshotDTO {
   const accounts = snapshot.config.accounts ?? defaultAccountsConfig();
@@ -154,6 +163,11 @@ function withSettingsDefaults(snapshot: SettingsSnapshotDTO): SettingsSnapshotDT
         forbiddenProbeConcurrency: accounts.forbiddenProbeConcurrency || 5,
         forbiddenProbeBatchSize: accounts.forbiddenProbeBatchSize || 100,
         forbiddenProbeSkipSuspended: accounts.forbiddenProbeSkipSuspended ?? true,
+        forbiddenReviewCooldown: accounts.forbiddenReviewCooldown || "24h",
+        forbiddenReviewMaxHits: accounts.forbiddenReviewMaxHits || 2,
+        forbiddenReviewFinalAction: accounts.forbiddenReviewFinalAction === "reauthRequired" || accounts.forbiddenReviewFinalAction === "delete"
+          ? accounts.forbiddenReviewFinalAction
+          : "disabled",
       },
     },
   };

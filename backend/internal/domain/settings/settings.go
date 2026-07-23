@@ -138,4 +138,10 @@ type AccountsConfig struct {
 	ForbiddenProbeBatchSize int
 	// ForbiddenProbeSkipSuspended 为 true 时跳过仍在 403 临时封禁窗口内的账号。
 	ForbiddenProbeSkipSuspended bool
+	// ForbiddenReviewCooldown 每次 403 后的临时封禁/复核等待时长。
+	ForbiddenReviewCooldown time.Duration
+	// ForbiddenReviewMaxHits 累计 403 命中达到该次数后执行终态动作。
+	ForbiddenReviewMaxHits int
+	// ForbiddenReviewFinalAction 达到 maxHits 后的动作：disabled | reauthRequired | delete。
+	ForbiddenReviewFinalAction string
 }

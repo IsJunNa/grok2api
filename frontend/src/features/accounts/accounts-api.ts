@@ -133,7 +133,7 @@ export type AccountSummaryDTO = {
   risk: number;
   providers: Record<AccountProvider, { total: number; available: number }>;
   recovery: { cooldown: number; waitingReset: number; probing: number };
-  issues: { disabled: number; reauthRequired: number };
+  issues: { forbidden: number; disabled: number; reauthRequired: number };
 };
 
 export type DeviceSessionDTO = {
@@ -195,7 +195,7 @@ const decodeAccountSummary = createObjectDecoder<AccountSummaryDTO>("account sum
   total: isNumber, available: isNumber, recovering: isNumber, attention: isNumber, risk: isNumber,
   providers: isRecordOf(hasShape({ total: isNumber, available: isNumber })),
   recovery: hasShape({ cooldown: isNumber, waitingReset: isNumber, probing: isNumber }),
-  issues: hasShape({ disabled: isNumber, reauthRequired: isNumber }),
+  issues: hasShape({ forbidden: isNumber, disabled: isNumber, reauthRequired: isNumber }),
 });
 const decodeDeviceSession = createObjectDecoder<DeviceSessionDTO>("device session", {
   sessionId: isString, userCode: isString, verificationUri: isString, verificationUriComplete: isOptional(isString),
@@ -316,6 +316,10 @@ export type AccountImportResultDTO = {
   updated: number;
   synced: number;
   syncFailed: number;
+  accountIds?: string[];
+  probeJobId?: string;
+  probeRunId?: string;
+  probeError?: string;
 };
 
 export type WebConsoleSyncResultDTO = AccountImportResultDTO & { skipped: number };
@@ -335,6 +339,7 @@ export type ForbiddenProbeJobState = "queued" | "running" | "completed" | "faile
 
 export type ForbiddenProbeJobDTO = {
   id: string;
+  runId?: string;
   state: ForbiddenProbeJobState;
   provider?: string;
   completed: number;
@@ -367,6 +372,7 @@ const isForbiddenProbeResult: ValueValidator = (value) => {
 
 const decodeForbiddenProbeJob = createObjectDecoder<ForbiddenProbeJobDTO>("forbidden probe job", {
   id: isString,
+  runId: isOptional(isString),
   state: isOneOf("queued", "running", "completed", "failed", "canceled"),
   provider: isOptional(isString),
   completed: isNumber,
@@ -377,86 +383,9 @@ const decodeForbiddenProbeJob = createObjectDecoder<ForbiddenProbeJobDTO>("forbi
   updatedAt: isString,
 });
 
-const forbiddenProbePollIntervalMs = 1_000;
-
-async function sleep(ms: number, signal?: AbortSignal): Promise<void> {
-  if (signal?.aborted) {
-    throw new DOMException("Aborted", "AbortError");
-  }
-  await new Promise<void>((resolve, reject) => {
-    const timer = window.setTimeout(() => {
-      signal?.removeEventListener("abort", onAbort);
-      resolve();
-    }, ms);
-    const onAbort = () => {
-      window.clearTimeout(timer);
-      signal?.removeEventListener("abort", onAbort);
-      reject(new DOMException("Aborted", "AbortError"));
-    };
-    signal?.addEventListener("abort", onAbort, { once: true });
-  });
-}
-
-async function cancelForbiddenProbeJob(jobId: string): Promise<void> {
-  try {
-    await apiRequest(`/api/admin/v1/accounts/probe-forbidden/jobs/${encodeURIComponent(jobId)}/cancel`, { method: "POST" }, decodeForbiddenProbeJob);
-  } catch {
-    // 关闭对话框或页面卸载时取消失败可忽略。
-  }
-}
-
-async function pollForbiddenProbeJob(
-  jobId: string,
-  onProgress?: (value: AccountTaskProgressDTO) => void,
-  signal?: AbortSignal,
-): Promise<ForbiddenProbeResultDTO> {
-  for (;;) {
-    if (signal?.aborted) {
-      await cancelForbiddenProbeJob(jobId);
-      throw new DOMException("Aborted", "AbortError");
-    }
-    const job = await apiRequest(
-      `/api/admin/v1/accounts/probe-forbidden/jobs/${encodeURIComponent(jobId)}`,
-      { method: "GET", signal },
-      decodeForbiddenProbeJob,
-    );
-    onProgress?.({ completed: job.completed, total: job.total });
-    if (job.state === "completed") {
-      if (!job.result) {
-        throw new ApiError(502, "invalidResponse", i18n.t("apiErrors.invalidResponse"));
-      }
-      return job.result;
-    }
-    if (job.state === "failed") {
-      const code = "forbiddenProbeFailed";
-      throw new ApiError(502, code, i18n.exists(`apiErrors.${code}`) ? i18n.t(`apiErrors.${code}`) : (job.error || i18n.t("apiErrors.requestFailed")));
-    }
-    if (job.state === "canceled") {
-      throw new DOMException("Aborted", "AbortError");
-    }
-    await sleep(forbiddenProbePollIntervalMs, signal);
-  }
-}
-
-async function runForbiddenProbeJob(
-  startPath: string,
-  body: object,
-  onProgress?: (value: AccountTaskProgressDTO) => void,
-  signal?: AbortSignal,
-): Promise<ForbiddenProbeResultDTO> {
-  const job = await apiRequest(startPath, { method: "POST", body, signal }, decodeForbiddenProbeJob);
-  onProgress?.({ completed: job.completed, total: job.total });
-  if (job.state === "completed" && job.result) {
-    return job.result;
-  }
-  try {
-    return await pollForbiddenProbeJob(job.id, onProgress, signal);
-  } catch (error) {
-    if (signal?.aborted || (error instanceof DOMException && error.name === "AbortError")) {
-      await cancelForbiddenProbeJob(job.id);
-    }
-    throw error;
-  }
+/** 启动后台 403 检测，立即返回 job（不等待完成）。进度请到 403 日志页查看。 */
+async function startForbiddenProbeJob(startPath: string, body: object, signal?: AbortSignal): Promise<ForbiddenProbeJobDTO> {
+  return apiRequest(startPath, { method: "POST", body, signal }, decodeForbiddenProbeJob);
 }
 
 type AccountTaskStreamPayload = Partial<
@@ -466,6 +395,10 @@ type AccountTaskStreamPayload = Partial<
     AccountImportResultDTO &
     ForbiddenProbeResultDTO
 > & {
+  accountIds?: string[];
+  probeJobId?: string;
+  probeRunId?: string;
+  probeError?: string;
   code?: string;
   message?: string;
 };
@@ -475,6 +408,7 @@ const decodeAccountTaskStreamPayload = createObjectDecoder<AccountTaskStreamPayl
   synced: isOptional(isNumber), syncFailed: isOptional(isNumber), completed: isOptional(isNumber), total: isOptional(isNumber),
   phase: isOptional(isOneOf("importing", "converting", "syncing")), updated: isOptional(isNumber), succeeded: isOptional(isNumber),
   probed: isOptional(isNumber), ok: isOptional(isNumber), forbidden: isOptional(isNumber), suspended: isOptional(isNumber), disabled: isOptional(isNumber),
+  accountIds: isOptional(isArrayOf(isString)), probeJobId: isOptional(isString), probeRunId: isOptional(isString), probeError: isOptional(isString),
   code: isOptional(isString), message: isOptional(isString),
 });
 
@@ -617,27 +551,22 @@ export function refreshAccountsTokens(ids: string[], provider: AccountProvider):
 export function probeAccountsForbidden(
   ids: string[],
   provider: AccountProvider,
-  onProgress?: (value: AccountTaskProgressDTO) => void,
   signal?: AbortSignal,
-): Promise<ForbiddenProbeResultDTO> {
-  // 异步任务 + 短轮询，避免 Cloudflare 代理长连接 524。
-  return runForbiddenProbeJob(
+): Promise<ForbiddenProbeJobDTO> {
+  return startForbiddenProbeJob(
     "/api/admin/v1/accounts/batch/probe-forbidden",
     { ids, provider },
-    onProgress,
     signal,
   );
 }
 
 export function probeAllAccountsForbidden(
   provider: AccountProvider,
-  onProgress?: (value: AccountTaskProgressDTO) => void,
   signal?: AbortSignal,
-): Promise<ForbiddenProbeResultDTO> {
-  return runForbiddenProbeJob(
+): Promise<ForbiddenProbeJobDTO> {
+  return startForbiddenProbeJob(
     "/api/admin/v1/accounts/probe-forbidden",
     { provider },
-    onProgress,
     signal,
   );
 }

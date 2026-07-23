@@ -420,6 +420,49 @@ type mediaJobModel struct {
 
 func (mediaJobModel) TableName() string { return "media_jobs" }
 
+// forbiddenProbeRunModel 记录每次 403 检测运行的汇总结果。
+type forbiddenProbeRunModel struct {
+	ID     uint64 `gorm:"primaryKey;autoIncrement"`
+	JobID  string `gorm:"size:64;not null;default:'';index;check:chk_forbidden_probe_runs_job_id,length(job_id) <= 64"`
+	// RunTrigger 使用独立列名，避免 SQL 保留字 trigger。
+	RunTrigger   string     `gorm:"column:run_trigger;size:32;not null;check:chk_forbidden_probe_runs_trigger,run_trigger IN ('manual_all','manual_batch','scheduled')"`
+	Provider     string     `gorm:"size:32;not null;default:'';check:chk_forbidden_probe_runs_provider,provider IN ('','grok_build','grok_web','grok_console')"`
+	State        string     `gorm:"size:16;not null;check:chk_forbidden_probe_runs_state,state IN ('running','completed','failed','canceled')"`
+	Total        int        `gorm:"not null;default:0;check:chk_forbidden_probe_runs_counts,total >= 0 AND completed >= 0 AND probed >= 0 AND ok >= 0 AND forbidden >= 0 AND failed >= 0 AND skipped >= 0 AND suspended >= 0 AND disabled >= 0"`
+	Completed    int        `gorm:"not null;default:0"`
+	Probed       int        `gorm:"not null;default:0"`
+	OK           int        `gorm:"not null;default:0"`
+	Forbidden    int        `gorm:"not null;default:0"`
+	Failed       int        `gorm:"not null;default:0"`
+	Skipped      int        `gorm:"not null;default:0"`
+	Suspended    int        `gorm:"not null;default:0"`
+	Disabled     int        `gorm:"not null;default:0"`
+	ErrorMessage string     `gorm:"column:error_message;size:512;not null;default:'';check:chk_forbidden_probe_runs_error,length(error_message) <= 512"`
+	StartedAt    time.Time  `gorm:"not null"`
+	FinishedAt   *time.Time
+	CreatedAt    time.Time `gorm:"not null"`
+	UpdatedAt    time.Time `gorm:"not null"`
+}
+
+func (forbiddenProbeRunModel) TableName() string { return "forbidden_probe_runs" }
+
+// forbiddenProbeRunItemModel 记录单次运行中每个账号的探测结果。
+type forbiddenProbeRunItemModel struct {
+	ID          uint64    `gorm:"primaryKey;autoIncrement"`
+	RunID       uint64    `gorm:"not null;index:idx_forbidden_probe_run_items_run_created,priority:1;check:chk_forbidden_probe_run_items_run_id,run_id > 0"`
+	AccountID   uint64    `gorm:"not null;index;check:chk_forbidden_probe_run_items_account_id,account_id > 0"`
+	AccountName string    `gorm:"size:160;not null;default:'';check:chk_forbidden_probe_run_items_account_name,length(account_name) <= 160"`
+	Provider    string    `gorm:"size:32;not null;default:'';check:chk_forbidden_probe_run_items_provider,provider IN ('','grok_build','grok_web','grok_console')"`
+	Outcome     string    `gorm:"size:16;not null;check:chk_forbidden_probe_run_items_outcome,outcome IN ('ok','forbidden','failed','skipped')"`
+	Suspended   bool      `gorm:"not null;default:false"`
+	Disabled    bool      `gorm:"not null;default:false"`
+	Detail      string    `gorm:"size:512;not null;default:'';check:chk_forbidden_probe_run_items_detail,length(detail) <= 512"`
+	CreatedAt   time.Time `gorm:"not null;index:idx_forbidden_probe_run_items_run_created,priority:2"`
+	Run         *forbiddenProbeRunModel `gorm:"foreignKey:RunID;references:ID;constraint:OnUpdate:CASCADE,OnDelete:CASCADE"`
+}
+
+func (forbiddenProbeRunItemModel) TableName() string { return "forbidden_probe_run_items" }
+
 // MaxVideoAssetBytes 是本地视频对象与上传接收的安全体积上限（256 MiB）。
 const MaxVideoAssetBytes = 256 << 20
 

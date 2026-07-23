@@ -250,6 +250,9 @@ type RecoverySummary struct {
 }
 
 type IssueSummary struct {
+	// Forbidden 含 403 临时封禁与 403 永久停用。
+	Forbidden      int64
+	// Disabled 为普通停用（不含 403-disabled）。
 	Disabled       int64
 	ReauthRequired int64
 }
@@ -269,12 +272,14 @@ func (s *Service) Summary(ctx context.Context) (Summary, error) {
 		result.Recovery.Cooldown += row.Cooldown
 		result.Recovery.WaitingReset += row.WaitingReset
 		result.Recovery.Probing += row.Probing
+		result.Issues.Forbidden += row.Forbidden
 		result.Issues.Disabled += row.Disabled
 		result.Issues.ReauthRequired += row.ReauthRequired
 		result.Providers[row.Provider] = ProviderSummary{Total: row.Total, Available: row.Available}
 	}
 	result.Recovering = result.Recovery.Cooldown + result.Recovery.WaitingReset + result.Recovery.Probing
-	result.Attention = result.Issues.Disabled + result.Issues.ReauthRequired
+	// 异常 = 等待恢复 + 普通停用 + 需重授权 + 403（临时/永久）。
+	result.Attention = result.Issues.Disabled + result.Issues.ReauthRequired + result.Issues.Forbidden
 	flaggedIDs, err := s.buildBotFlaggedAccountIDs(ctx)
 	if err != nil {
 		return Summary{}, err
@@ -287,6 +292,7 @@ func (s *Service) Summary(ctx context.Context) (Summary, error) {
 type Service struct {
 	accounts              repository.AccountRepository
 	audits                repository.AuditRepository
+	forbiddenProbeLogs    repository.ForbiddenProbeLogRepository
 	deviceSessions        repository.DeviceSessionRepository
 	sticky                repository.StickySessionRepository
 	refreshLock           repository.DistributedLock
@@ -325,6 +331,11 @@ type Service struct {
 	buildBotFlagCache      *resultcache.Cache[string, []uint64]
 	logger                 *slog.Logger
 	now                    func() time.Time
+}
+
+// SetForbiddenProbeLogRepository 注入 403 检测运行日志仓储（可选，缺省则不落库）。
+func (s *Service) SetForbiddenProbeLogRepository(value repository.ForbiddenProbeLogRepository) {
+	s.forbiddenProbeLogs = value
 }
 
 func (s *Service) SetQuotaRecoveryQueue(queue repository.QuotaRecoveryQueue) {
@@ -377,6 +388,7 @@ func NewService(accounts repository.AccountRepository, audits repository.AuditRe
 		autoCleanWake: make(chan struct{}, 1),
 		forbiddenProbe: ForbiddenProbeConfig{
 			Enabled: false, Interval: 6 * time.Hour, Concurrency: 5, BatchSize: 100, SkipSuspended: true,
+			ReviewCooldown: 24 * time.Hour, ReviewMaxHits: 2, ReviewFinalAction: ForbiddenReviewFinalDisabled,
 		},
 		forbiddenProbeWake: make(chan struct{}, 1),
 		forbiddenProbeJobs: make(map[string]*forbiddenProbeJob),
@@ -1764,17 +1776,19 @@ func (s *Service) MarkAccountsForbidden(ctx context.Context, ids []uint64, detai
 	return result, nil
 }
 
-// HandleChatForbidden 处理聊天上游 403：
-//   - 首次：24h 临时封禁（LastError=403:…，CooldownUntil=+24h），到期自动回池
-//   - 24h 放回后再 403：永久停用（enabled=false，LastError=403-disabled:…）
-// 返回 permanent=true 表示已永久停用。
+// HandleChatForbidden 处理聊天上游 403（策略来自 ForbiddenProbe 设置）：
+//   - 窗口内再次 403：不增加命中次数，仅保持冷却
+//   - 窗口外再次 403：hits+1；未达 maxHits 则继续临时封禁 ReviewCooldown
+//   - 达到 maxHits：按 ReviewFinalAction 执行 disabled / reauthRequired / delete
+// 返回 permanent=true 表示已进入终态（停用/需重授权/删除）。
 func (s *Service) HandleChatForbidden(ctx context.Context, credential accountdomain.Credential, detail string) (permanent bool, err error) {
 	now := s.now()
 	detail = strings.TrimSpace(detail)
 	if detail == "" {
 		detail = "上游拒绝了该请求"
 	}
-	// 已在 403 临时封禁窗口内：只保证冷却与标记，不升级为永久停用。
+	cfg := s.ForbiddenProbeConfigSnapshot()
+	// 已在 403 临时封禁窗口内：只保证冷却与标记，不增加命中次数。
 	if accountdomain.IsActiveChatForbiddenCooldown(credential.LastError, credential.CooldownUntil, now) {
 		until := *credential.CooldownUntil
 		if err := s.accounts.UpdateHealth(ctx, credential.ID, max(1, credential.FailureCount), &until, credential.LastError, false); err != nil {
@@ -1785,20 +1799,18 @@ func (s *Service) HandleChatForbidden(ctx context.Context, credential accountdom
 		}
 		return false, nil
 	}
-	// 24h 放回后（标记仍在）再次 403：永久停用。
-	if accountdomain.IsRecoveredChatForbiddenProbe(credential.LastError, credential.CooldownUntil, now) {
-		reason := accountdomain.ChatForbiddenDisabledPrefix + detail
-		if err := s.Disable(ctx, credential.ID, reason); err != nil {
-			return true, err
-		}
-		return true, nil
+	prevHits := accountdomain.ChatForbiddenHitCount(credential.LastError)
+	hits := prevHits + 1
+	if hits < 1 {
+		hits = 1
 	}
-	// 首次 403：24h 临时封禁。
-	until := now.Add(accountdomain.ChatForbiddenCooldown)
-	reason := accountdomain.ChatForbiddenSuspendPrefix + detail
-	if len(reason) > 512 {
-		reason = reason[:512]
+	// 达到复核上限：执行终态动作。
+	if hits >= cfg.ReviewMaxHits {
+		return true, s.applyForbiddenReviewFinal(ctx, credential, hits, detail, cfg.ReviewFinalAction)
 	}
+	// 未达上限：临时封禁，等待下次复核。
+	until := now.Add(cfg.ReviewCooldown)
+	reason := accountdomain.FormatChatForbiddenSuspend(hits, detail)
 	if err := s.accounts.UpdateHealth(ctx, credential.ID, max(1, credential.FailureCount+1), &until, reason, false); err != nil {
 		return false, mapRepositoryError(err)
 	}
@@ -1806,6 +1818,25 @@ func (s *Service) HandleChatForbidden(ctx context.Context, credential accountdom
 		_ = s.sticky.DeleteByAccount(ctx, credential.ID)
 	}
 	return false, nil
+}
+
+func (s *Service) applyForbiddenReviewFinal(ctx context.Context, credential accountdomain.Credential, hits int, detail, action string) error {
+	switch action {
+	case ForbiddenReviewFinalDelete:
+		if err := s.Delete(ctx, credential.ID); err != nil {
+			return err
+		}
+		return nil
+	case ForbiddenReviewFinalReauth:
+		reason := accountdomain.FormatChatForbiddenDisabled(hits, detail)
+		if err := s.MarkReauthRequired(ctx, credential.ID, reason); err != nil {
+			return err
+		}
+		return nil
+	default:
+		reason := accountdomain.FormatChatForbiddenDisabled(hits, detail)
+		return s.Disable(ctx, credential.ID, reason)
+	}
 }
 
 // markSSOCredentialRejected 在上游明确返回 401 后可靠持久化失效状态。

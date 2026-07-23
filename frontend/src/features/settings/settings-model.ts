@@ -140,6 +140,12 @@ export const settingsSchema = z.object({
     forbiddenProbeConcurrency: z.number().int().min(1).max(20),
     forbiddenProbeBatchSize: z.number().int().min(10).max(1_000),
     forbiddenProbeSkipSuspended: z.boolean(),
+    forbiddenReviewCooldown: durationSchema.refine((value) => {
+      const seconds = durationSeconds(value);
+      return seconds >= 3_600 && seconds <= 168 * 3_600;
+    }),
+    forbiddenReviewMaxHits: z.number().int().min(1).max(20),
+    forbiddenReviewFinalAction: z.enum(["disabled", "reauthRequired", "delete"]),
   }),
 });
 
@@ -185,6 +191,9 @@ export function toSettingsForm(config: SettingsConfigDTO): SettingsForm {
       forbiddenProbeConcurrency: config.accounts.forbiddenProbeConcurrency,
       forbiddenProbeBatchSize: config.accounts.forbiddenProbeBatchSize,
       forbiddenProbeSkipSuspended: config.accounts.forbiddenProbeSkipSuspended,
+      forbiddenReviewCooldown: parseDuration(config.accounts.forbiddenReviewCooldown),
+      forbiddenReviewMaxHits: config.accounts.forbiddenReviewMaxHits,
+      forbiddenReviewFinalAction: config.accounts.forbiddenReviewFinalAction,
     },
   };
 }
@@ -228,6 +237,9 @@ export function toSettingsDTO(config: SettingsForm): SettingsConfigDTO {
       forbiddenProbeConcurrency: config.accounts.forbiddenProbeConcurrency,
       forbiddenProbeBatchSize: config.accounts.forbiddenProbeBatchSize,
       forbiddenProbeSkipSuspended: config.accounts.forbiddenProbeSkipSuspended,
+      forbiddenReviewCooldown: formatDuration(config.accounts.forbiddenReviewCooldown),
+      forbiddenReviewMaxHits: config.accounts.forbiddenReviewMaxHits,
+      forbiddenReviewFinalAction: config.accounts.forbiddenReviewFinalAction,
     },
   };
 }

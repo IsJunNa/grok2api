@@ -158,6 +158,10 @@ func (h *Handler) Register(router *gin.RouterGroup) {
 	router.POST("/accounts/probe-forbidden", h.probeAllForbidden)
 	router.GET("/accounts/probe-forbidden/jobs/:jobId", h.getForbiddenProbeJob)
 	router.POST("/accounts/probe-forbidden/jobs/:jobId/cancel", h.cancelForbiddenProbeJob)
+	router.GET("/accounts/probe-forbidden/logs", h.listForbiddenProbeLogs)
+	router.GET("/accounts/probe-forbidden/logs/:runId", h.getForbiddenProbeLog)
+	router.GET("/accounts/probe-forbidden/logs/:runId/items", h.listForbiddenProbeLogItems)
+	router.POST("/accounts/probe-forbidden/logs/:runId/cancel", h.cancelForbiddenProbeRun)
 	router.PATCH("/accounts/batch", h.batchUpdate)
 	router.DELETE("/accounts", h.batchDelete)
 	router.PATCH("/accounts/:id", h.update)
@@ -237,11 +241,16 @@ type accountTokenRefreshResponse struct {
 }
 
 type accountImportResponse struct {
-	Created    int `json:"created"`
-	Updated    int `json:"updated"`
-	Skipped    int `json:"skipped"`
-	Synced     int `json:"synced"`
-	SyncFailed int `json:"syncFailed"`
+	Created    int      `json:"created"`
+	Updated    int      `json:"updated"`
+	Skipped    int      `json:"skipped"`
+	Synced     int      `json:"synced"`
+	SyncFailed int      `json:"syncFailed"`
+	AccountIDs []string `json:"accountIds,omitempty"`
+	// 导入成功后自动启动的 403 检测任务（后台执行）。
+	ProbeJobID string `json:"probeJobId,omitempty"`
+	ProbeRunID string `json:"probeRunId,omitempty"`
+	ProbeError string `json:"probeError,omitempty"`
 }
 
 type accountResponse struct {
@@ -408,7 +417,9 @@ func (h *Handler) summary(c *gin.Context) {
 			string(accountdomain.ProviderConsole): gin.H{"total": console.Total, "available": console.Available},
 		},
 		"recovery": gin.H{"cooldown": value.Recovery.Cooldown, "waitingReset": value.Recovery.WaitingReset, "probing": value.Recovery.Probing},
-		"issues":   gin.H{"disabled": value.Issues.Disabled, "reauthRequired": value.Issues.ReauthRequired},
+		"issues": gin.H{
+			"forbidden": value.Issues.Forbidden, "disabled": value.Issues.Disabled, "reauthRequired": value.Issues.ReauthRequired,
+		},
 	})
 }
 
@@ -675,6 +686,161 @@ func (h *Handler) cancelForbiddenProbeJob(c *gin.Context) {
 		return
 	}
 	response.Success(c, http.StatusOK, job)
+}
+
+type forbiddenProbeLogResponse struct {
+	ID         uint64     `json:"id,string"`
+	JobID      string     `json:"jobId,omitempty"`
+	Trigger    string     `json:"trigger"`
+	Provider   string     `json:"provider,omitempty"`
+	State      string     `json:"state"`
+	Total      int        `json:"total"`
+	Completed  int        `json:"completed"`
+	Probed     int        `json:"probed"`
+	OK         int        `json:"ok"`
+	Forbidden  int        `json:"forbidden"`
+	Failed     int        `json:"failed"`
+	Skipped    int        `json:"skipped"`
+	Suspended  int        `json:"suspended"`
+	Disabled   int        `json:"disabled"`
+	Error      string     `json:"error,omitempty"`
+	StartedAt  time.Time  `json:"startedAt"`
+	FinishedAt *time.Time `json:"finishedAt,omitempty"`
+	CreatedAt  time.Time  `json:"createdAt"`
+	UpdatedAt  time.Time  `json:"updatedAt"`
+	DurationMS int64      `json:"durationMs"`
+}
+
+type forbiddenProbeLogItemResponse struct {
+	ID          uint64    `json:"id,string"`
+	RunID       uint64    `json:"runId,string"`
+	AccountID   uint64    `json:"accountId,string"`
+	AccountName string    `json:"accountName"`
+	Provider    string    `json:"provider,omitempty"`
+	Outcome     string    `json:"outcome"`
+	Suspended   bool      `json:"suspended"`
+	Disabled    bool      `json:"disabled"`
+	Detail      string    `json:"detail,omitempty"`
+	CreatedAt   time.Time `json:"createdAt"`
+}
+
+func toForbiddenProbeLogResponse(item accountdomain.ForbiddenProbeRun) forbiddenProbeLogResponse {
+	end := item.UpdatedAt
+	if item.FinishedAt != nil {
+		end = *item.FinishedAt
+	}
+	duration := end.Sub(item.StartedAt).Milliseconds()
+	if duration < 0 {
+		duration = 0
+	}
+	return forbiddenProbeLogResponse{
+		ID: item.ID, JobID: item.JobID, Trigger: item.Trigger, Provider: item.Provider, State: item.State,
+		Total: item.Total, Completed: item.Completed, Probed: item.Probed, OK: item.OK, Forbidden: item.Forbidden,
+		Failed: item.Failed, Skipped: item.Skipped, Suspended: item.Suspended, Disabled: item.Disabled, Error: item.Error,
+		StartedAt: item.StartedAt, FinishedAt: item.FinishedAt, CreatedAt: item.CreatedAt, UpdatedAt: item.UpdatedAt,
+		DurationMS: duration,
+	}
+}
+
+func (h *Handler) listForbiddenProbeLogs(c *gin.Context) {
+	page, pageSize := pagination(c)
+	providerFilter := strings.TrimSpace(c.Query("provider"))
+	trigger := strings.TrimSpace(c.Query("trigger"))
+	state := strings.TrimSpace(c.Query("state"))
+	search := strings.TrimSpace(c.Query("search"))
+	items, total, page, pageSize, err := h.service.ListForbiddenProbeLogs(c.Request.Context(), page, pageSize, providerFilter, trigger, state, search)
+	if err != nil {
+		if errors.Is(err, accountapp.ErrInvalidInput) {
+			response.Error(c, http.StatusBadRequest, "invalidRequest", err.Error())
+			return
+		}
+		h.writeServiceError(c, "forbiddenProbeLogListFailed", err, http.StatusInternalServerError, "读取 403 检测日志失败")
+		return
+	}
+	out := make([]forbiddenProbeLogResponse, 0, len(items))
+	for _, item := range items {
+		out = append(out, toForbiddenProbeLogResponse(item))
+	}
+	response.Success(c, http.StatusOK, gin.H{
+		"items": out, "page": page, "pageSize": pageSize, "total": total,
+	})
+}
+
+func (h *Handler) getForbiddenProbeLog(c *gin.Context) {
+	runID, ok := parseRunID(c)
+	if !ok {
+		return
+	}
+	item, err := h.service.GetForbiddenProbeLog(c.Request.Context(), runID)
+	if err != nil {
+		if errors.Is(err, accountapp.ErrForbiddenProbeJobNotFound) {
+			response.Error(c, http.StatusNotFound, "forbiddenProbeJobNotFound", "403 检测记录不存在")
+			return
+		}
+		h.writeServiceError(c, "forbiddenProbeLogListFailed", err, http.StatusInternalServerError, "读取 403 检测日志失败")
+		return
+	}
+	response.Success(c, http.StatusOK, toForbiddenProbeLogResponse(item))
+}
+
+func (h *Handler) listForbiddenProbeLogItems(c *gin.Context) {
+	runID, ok := parseRunID(c)
+	if !ok {
+		return
+	}
+	page, pageSize := pagination(c)
+	search := strings.TrimSpace(c.Query("search"))
+	items, total, page, pageSize, err := h.service.ListForbiddenProbeLogItems(c.Request.Context(), runID, page, pageSize, search)
+	if err != nil {
+		if errors.Is(err, accountapp.ErrForbiddenProbeJobNotFound) {
+			response.Error(c, http.StatusNotFound, "forbiddenProbeJobNotFound", "403 检测记录不存在")
+			return
+		}
+		if errors.Is(err, accountapp.ErrInvalidInput) {
+			response.Error(c, http.StatusBadRequest, "invalidRequest", err.Error())
+			return
+		}
+		h.writeServiceError(c, "forbiddenProbeLogListFailed", err, http.StatusInternalServerError, "读取 403 检测明细失败")
+		return
+	}
+	out := make([]forbiddenProbeLogItemResponse, 0, len(items))
+	for _, item := range items {
+		out = append(out, forbiddenProbeLogItemResponse{
+			ID: item.ID, RunID: item.RunID, AccountID: item.AccountID, AccountName: item.AccountName,
+			Provider: item.Provider, Outcome: item.Outcome, Suspended: item.Suspended, Disabled: item.Disabled,
+			Detail: item.Detail, CreatedAt: item.CreatedAt,
+		})
+	}
+	response.Success(c, http.StatusOK, gin.H{
+		"items": out, "page": page, "pageSize": pageSize, "total": total,
+	})
+}
+
+func (h *Handler) cancelForbiddenProbeRun(c *gin.Context) {
+	runID, ok := parseRunID(c)
+	if !ok {
+		return
+	}
+	item, err := h.service.CancelForbiddenProbeRun(c.Request.Context(), runID)
+	if err != nil {
+		if errors.Is(err, accountapp.ErrForbiddenProbeJobNotFound) {
+			response.Error(c, http.StatusNotFound, "forbiddenProbeJobNotFound", "403 检测记录不存在")
+			return
+		}
+		h.writeServiceError(c, "forbiddenProbeFailed", err, http.StatusInternalServerError, "取消 403 检测失败")
+		return
+	}
+	response.Success(c, http.StatusOK, toForbiddenProbeLogResponse(item))
+}
+
+func parseRunID(c *gin.Context) (uint64, bool) {
+	raw := strings.TrimSpace(c.Param("runId"))
+	id, err := strconv.ParseUint(raw, 10, 64)
+	if err != nil || id == 0 {
+		response.Error(c, http.StatusBadRequest, "invalidId", "运行 ID 无效")
+		return 0, false
+	}
+	return id, true
 }
 
 func (h *Handler) forbiddenProbeConfig() accountapp.ForbiddenProbeConfig {
@@ -1016,7 +1182,38 @@ func (h *Handler) importFile(c *gin.Context, providerValue accountdomain.Provide
 		stream.WriteError("authImportFailed", "导入账号失败")
 		return
 	}
-	_ = stream.Write("complete", accountImportResponse{Created: result.Created, Updated: result.Updated, Synced: syncResult.Succeeded, SyncFailed: syncResult.Failed})
+	responsePayload := accountImportResponse{
+		Created: result.Created, Updated: result.Updated, Synced: syncResult.Succeeded, SyncFailed: syncResult.Failed,
+		AccountIDs: uint64IDsToStrings(result.AccountIDs),
+	}
+	// 导入完成后立即后台 403 检测本次写入的账号（新建 + 更新）。
+	if len(result.AccountIDs) > 0 {
+		job, probeErr := h.service.StartForbiddenProbeJobForIDs(result.AccountIDs, string(providerValue), h.forbiddenProbeConfig())
+		if probeErr != nil {
+			if errors.Is(probeErr, accountapp.ErrForbiddenProbeBusy) {
+				responsePayload.ProbeError = "已有 403 检测任务在运行，导入后的自动检测已跳过"
+			} else {
+				responsePayload.ProbeError = probeErr.Error()
+			}
+		} else {
+			responsePayload.ProbeJobID = job.ID
+			if job.RunID > 0 {
+				responsePayload.ProbeRunID = strconv.FormatUint(job.RunID, 10)
+			}
+		}
+	}
+	_ = stream.Write("complete", responsePayload)
+}
+
+func uint64IDsToStrings(ids []uint64) []string {
+	if len(ids) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(ids))
+	for _, id := range ids {
+		out = append(out, strconv.FormatUint(id, 10))
+	}
+	return out
 }
 
 func readAccountImportDocuments(c *gin.Context, fileDescription string) ([][]byte, bool) {

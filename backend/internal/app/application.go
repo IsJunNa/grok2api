@@ -112,6 +112,7 @@ func New(ctx context.Context, cfg config.Config, logger *slog.Logger) (*Applicat
 	adminRepo := relational.NewAdminRepository(database)
 	sessionRepo := relational.NewAdminSessionRepository(database)
 	accountRepo := relational.NewAccountRepository(database)
+	forbiddenProbeLogRepo := relational.NewForbiddenProbeLogRepository(database)
 	modelRepo := relational.NewModelRepository(database)
 	clientKeyRepo := relational.NewClientKeyRepository(database)
 	auditRepo := relational.NewAuditRepository(database)
@@ -238,6 +239,7 @@ func New(ctx context.Context, cfg config.Config, logger *slog.Logger) (*Applicat
 		pool.UpdateJitter(cfg.Batch.RandomDelay.Value())
 	}
 	accountService := accountapp.NewService(accountRepo, auditRepo, deviceSessions, sticky, providers, cipher, refreshLock)
+	accountService.SetForbiddenProbeLogRepository(forbiddenProbeLogRepo)
 	cliAdapter.SetFallbackMarker(accountService)
 	accountService.SetLogger(logger)
 	accountService.UpdateAutoCleanConfig(accountAutoCleanConfig(cfg.Accounts))
@@ -423,11 +425,14 @@ func accountAutoCleanConfig(value config.AccountsConfig) accountapp.AutoCleanCon
 
 func accountForbiddenProbeConfig(value config.AccountsConfig) accountapp.ForbiddenProbeConfig {
 	return accountapp.ForbiddenProbeConfig{
-		Enabled:       value.ForbiddenProbeEnabled,
-		Interval:      value.ForbiddenProbeInterval.Value(),
-		Concurrency:   value.ForbiddenProbeConcurrency,
-		BatchSize:     value.ForbiddenProbeBatchSize,
-		SkipSuspended: value.ForbiddenProbeSkipSuspended,
+		Enabled:           value.ForbiddenProbeEnabled,
+		Interval:          value.ForbiddenProbeInterval.Value(),
+		Concurrency:       value.ForbiddenProbeConcurrency,
+		BatchSize:         value.ForbiddenProbeBatchSize,
+		SkipSuspended:     value.ForbiddenProbeSkipSuspended,
+		ReviewCooldown:    value.ForbiddenReviewCooldown.Value(),
+		ReviewMaxHits:     value.ForbiddenReviewMaxHits,
+		ReviewFinalAction: value.ForbiddenReviewFinalAction,
 	}
 }
 

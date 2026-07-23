@@ -4,6 +4,7 @@ import { ArrowRight, ClipboardPaste, Compass, Download, ExternalLink, FileUp, Li
 import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 import { useForm, useWatch } from "react-hook-form";
 import { useTranslation } from "react-i18next";
+import { useNavigate } from "react-router-dom";
 import { toast } from "sonner";
 import { z } from "zod";
 
@@ -102,6 +103,7 @@ type AccountSelection = {
 };
 
 export function AccountsPage() {
+  const navigate = useNavigate();
   const { t, i18n } = useTranslation();
   const queryClient = useQueryClient();
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -145,8 +147,6 @@ export function AccountsPage() {
   const [renewalProgress, setRenewalProgress] = useState<AccountTaskProgressDTO | null>(null);
   const [forbiddenProbeOpen, setForbiddenProbeOpen] = useState(false);
   const [forbiddenProbeBatchOpen, setForbiddenProbeBatchOpen] = useState(false);
-  const [forbiddenProbeProgress, setForbiddenProbeProgress] = useState<AccountTaskProgressDTO | null>(null);
-  const forbiddenProbeAbortRef = useRef<AbortController | null>(null);
   const [editing, setEditing] = useState<AccountDTO | null>(null);
   const [deleting, setDeleting] = useState<AccountDTO | null>(null);
   const [deviceOpen, setDeviceOpen] = useState(false);
@@ -427,9 +427,21 @@ export function AccountsPage() {
       setQuickImportTokens("");
       if (result.syncFailed > 0) {
         toast.warning(t("accounts.importedWithSyncFailures", result));
+      } else {
+        toast.success(t("accounts.imported", result));
+      }
+      // 后端导入成功后会自动对本次账号启动 403 检测；有任务则跳转日志页。
+      if (result.probeRunId || result.probeJobId) {
+        toast.success(t("accounts.importedProbeStarted"));
+        const target = result.probeRunId
+          ? `/forbidden-probe-logs?runId=${encodeURIComponent(result.probeRunId)}`
+          : "/forbidden-probe-logs";
+        navigate(target);
         return;
       }
-      toast.success(t("accounts.imported", result));
+      if (result.probeError) {
+        toast.warning(result.probeError);
+      }
     },
     onError: (error) => {
       if (importToastRef.current !== null) toast.dismiss(importToastRef.current);
@@ -495,46 +507,30 @@ export function AccountsPage() {
   });
 
   const forbiddenProbeMutation = useMutation({
-    mutationFn: () => {
-      forbiddenProbeAbortRef.current?.abort();
-      const controller = new AbortController();
-      forbiddenProbeAbortRef.current = controller;
-      setForbiddenProbeProgress({ completed: 0, total: 0 });
-      return probeAllAccountsForbidden(provider, setForbiddenProbeProgress, controller.signal);
-    },
-    onSuccess: (result) => {
+    mutationFn: () => probeAllAccountsForbidden(provider),
+    onSuccess: (job) => {
       setForbiddenProbeOpen(false);
-      setForbiddenProbeProgress(null);
-      invalidateAccountData();
-      toast.success(t("accounts.forbiddenProbeCompleted", result));
+      toast.success(t("accounts.forbiddenProbeStarted"));
+      const target = job.runId
+        ? `/forbidden-probe-logs?runId=${encodeURIComponent(job.runId)}`
+        : "/forbidden-probe-logs";
+      navigate(target);
     },
-    onError: (error) => {
-      setForbiddenProbeProgress(null);
-      if (isAbortError(error)) return;
-      showError(error);
-    },
+    onError: showError,
   });
 
   const forbiddenProbeBatchMutation = useMutation({
-    mutationFn: () => {
-      forbiddenProbeAbortRef.current?.abort();
-      const controller = new AbortController();
-      forbiddenProbeAbortRef.current = controller;
-      setForbiddenProbeProgress({ completed: 0, total: selected.size });
-      return probeAccountsForbidden([...selected], provider, setForbiddenProbeProgress, controller.signal);
-    },
-    onSuccess: (result) => {
+    mutationFn: () => probeAccountsForbidden([...selected], provider),
+    onSuccess: (job) => {
       clearSelection();
       setForbiddenProbeBatchOpen(false);
-      setForbiddenProbeProgress(null);
-      invalidateAccountData();
-      toast.success(t("accounts.forbiddenProbeCompleted", result));
+      toast.success(t("accounts.forbiddenProbeStarted"));
+      const target = job.runId
+        ? `/forbidden-probe-logs?runId=${encodeURIComponent(job.runId)}`
+        : "/forbidden-probe-logs";
+      navigate(target);
     },
-    onError: (error) => {
-      setForbiddenProbeProgress(null);
-      if (isAbortError(error)) return;
-      showError(error);
-    },
+    onError: showError,
   });
 
   const bindEgressMutation = useMutation({
@@ -759,10 +755,12 @@ export function AccountsPage() {
 
   const summary = summaryQuery.data;
   const recoveringAccounts = summary?.recovering ?? 0;
+  const forbiddenAccounts = summary?.issues.forbidden ?? 0;
   const disabledAccounts = summary?.issues.disabled ?? 0;
   const invalidAccounts = summary?.issues.reauthRequired ?? 0;
   const riskAccounts = summary?.risk ?? 0;
-  const abnormalAccounts = recoveringAccounts + disabledAccounts + invalidAccounts;
+  // 异常总数含 403（临时 + 永久）；普通停用已排除 403-disabled，避免重复。
+  const abnormalAccounts = recoveringAccounts + forbiddenAccounts + disabledAccounts + invalidAccounts;
   const buildSummary = summary?.providers.grok_build ?? { total: 0, available: 0 };
   const webSummary = summary?.providers.grok_web ?? { total: 0, available: 0 };
   const consoleSummary = summary?.providers.grok_console ?? { total: 0, available: 0 };
@@ -795,9 +793,30 @@ export function AccountsPage() {
         <p className="sr-only">{t("console.accountsDescription")}</p>
       </header>
       <section className="grid gap-2 sm:grid-cols-2 xl:grid-cols-4">
-        <AccountMetricPanel tone="text-quota-product-1" icon={<SquareTerminal />} loading={summaryLoading} label={t("accounts.buildAccountCount")} value={summaryUnavailable ? "-" : formatNumber(buildSummary.total, i18n.language, 0)} detail={t("accounts.routableAccountCount", { count: formatNumber(buildSummary.available, i18n.language, 0) })} />
-        <AccountMetricPanel tone="text-quota-product-2" icon={<Compass />} loading={summaryLoading} label={t("accounts.webAccountCount")} value={summaryUnavailable ? "-" : formatNumber(webSummary.total, i18n.language, 0)} detail={t("accounts.routableAccountCount", { count: formatNumber(webSummary.available, i18n.language, 0) })} />
-        <AccountMetricPanel tone="text-quota-product-4" icon={<Webhook />} loading={summaryLoading} label={t("accounts.consoleAccountCount")} value={summaryUnavailable ? "-" : formatNumber(consoleSummary.total, i18n.language, 0)} detail={t("accounts.routableAccountCount", { count: formatNumber(consoleSummary.available, i18n.language, 0) })} />
+        <AccountMetricPanel
+          tone="text-quota-product-1"
+          icon={<SquareTerminal />}
+          loading={summaryLoading}
+          label={t("accounts.buildAccountCount")}
+          value={summaryUnavailable ? "-" : formatNumber(buildSummary.available, i18n.language, 0)}
+          detail={t("accounts.totalAccountCount", { count: formatNumber(buildSummary.total, i18n.language, 0) })}
+        />
+        <AccountMetricPanel
+          tone="text-quota-product-2"
+          icon={<Compass />}
+          loading={summaryLoading}
+          label={t("accounts.webAccountCount")}
+          value={summaryUnavailable ? "-" : formatNumber(webSummary.available, i18n.language, 0)}
+          detail={t("accounts.totalAccountCount", { count: formatNumber(webSummary.total, i18n.language, 0) })}
+        />
+        <AccountMetricPanel
+          tone="text-quota-product-4"
+          icon={<Webhook />}
+          loading={summaryLoading}
+          label={t("accounts.consoleAccountCount")}
+          value={summaryUnavailable ? "-" : formatNumber(consoleSummary.available, i18n.language, 0)}
+          detail={t("accounts.totalAccountCount", { count: formatNumber(consoleSummary.total, i18n.language, 0) })}
+        />
         <AccountMetricPanel
           tone={abnormalAccounts > 0 ? "text-amber-600 dark:text-amber-400" : "text-muted-foreground"}
           icon={<TriangleAlert />}
@@ -806,6 +825,7 @@ export function AccountsPage() {
           value={summaryUnavailable ? "-" : formatNumber(abnormalAccounts, i18n.language, 0)}
           detail={[
             `${t("accounts.statusCooldown")} ${formatNumber(recoveringAccounts, i18n.language, 0)}`,
+            `${t("accounts.statusForbidden")} ${formatNumber(forbiddenAccounts, i18n.language, 0)}`,
             `${t("accounts.riskAccountCount", { count: formatNumber(riskAccounts, i18n.language, 0) })}`,
             `${t("accounts.statusDisabled")} ${formatNumber(disabledAccounts, i18n.language, 0)}`,
             `${t("accounts.statusReauthRequired")} ${formatNumber(invalidAccounts, i18n.language, 0)}`,
@@ -1044,13 +1064,7 @@ export function AccountsPage() {
         />
       ) : null}
 
-      <AlertDialog open={forbiddenProbeOpen} onOpenChange={(open) => {
-        if (!open) {
-          forbiddenProbeAbortRef.current?.abort();
-          setForbiddenProbeProgress(null);
-        }
-        setForbiddenProbeOpen(open);
-      }}>
+      <AlertDialog open={forbiddenProbeOpen} onOpenChange={setForbiddenProbeOpen}>
         <AlertDialogContent>
           <AlertDialogHeader>
             <AlertDialogTitle>{t("accounts.forbiddenProbeTitle")}</AlertDialogTitle>
@@ -1059,21 +1073,13 @@ export function AccountsPage() {
           <AlertDialogFooter>
             <AlertDialogCancel>{t("common.cancel")}</AlertDialogCancel>
             <AlertDialogAction disabled={forbiddenProbeMutation.isPending} onClick={(event) => { event.preventDefault(); forbiddenProbeMutation.mutate(); }}>
-              {forbiddenProbeMutation.isPending
-                ? <><Spinner /><span className="tabular-nums">{forbiddenProbeProgress && forbiddenProbeProgress.total > 0 ? `${forbiddenProbeProgress.completed} / ${forbiddenProbeProgress.total}` : t("common.loading")}</span></>
-                : t("accounts.forbiddenProbeStart")}
+              {forbiddenProbeMutation.isPending ? <><Spinner />{t("common.loading")}</> : t("accounts.forbiddenProbeStart")}
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>
 
-      <AlertDialog open={forbiddenProbeBatchOpen} onOpenChange={(open) => {
-        if (!open) {
-          forbiddenProbeAbortRef.current?.abort();
-          setForbiddenProbeProgress(null);
-        }
-        setForbiddenProbeBatchOpen(open);
-      }}>
+      <AlertDialog open={forbiddenProbeBatchOpen} onOpenChange={setForbiddenProbeBatchOpen}>
         <AlertDialogContent>
           <AlertDialogHeader>
             <AlertDialogTitle>{t("accounts.forbiddenProbeBatchTitle", { count: selected.size })}</AlertDialogTitle>
@@ -1082,9 +1088,7 @@ export function AccountsPage() {
           <AlertDialogFooter>
             <AlertDialogCancel>{t("common.cancel")}</AlertDialogCancel>
             <AlertDialogAction disabled={forbiddenProbeBatchMutation.isPending} onClick={(event) => { event.preventDefault(); forbiddenProbeBatchMutation.mutate(); }}>
-              {forbiddenProbeBatchMutation.isPending
-                ? <><Spinner /><span className="tabular-nums">{forbiddenProbeProgress && forbiddenProbeProgress.total > 0 ? `${forbiddenProbeProgress.completed} / ${forbiddenProbeProgress.total}` : t("common.loading")}</span></>
-                : t("accounts.forbiddenProbeStart")}
+              {forbiddenProbeBatchMutation.isPending ? <><Spinner />{t("common.loading")}</> : t("accounts.forbiddenProbeStart")}
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>

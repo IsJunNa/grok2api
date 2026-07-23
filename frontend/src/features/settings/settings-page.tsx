@@ -331,6 +331,28 @@ export function SettingsPage() {
                   </div>
                 )} />
               </SettingsField>
+              <SettingsField controlId="accounts-forbidden-review-cooldown" label={t("settings.accounts.forbiddenReviewCooldown")} description={t("settings.accounts.forbiddenReviewCooldownHelp")} error={form.formState.errors.accounts?.forbiddenReviewCooldown?.message}>
+                <Controller control={form.control} name="accounts.forbiddenReviewCooldown" render={({ field }) => (
+                  <DurationInput id="accounts-forbidden-review-cooldown" value={field.value} onChange={field.onChange} />
+                )} />
+              </SettingsField>
+              <SettingsField controlId="accounts-forbidden-review-max-hits" label={t("settings.accounts.forbiddenReviewMaxHits")} description={t("settings.accounts.forbiddenReviewMaxHitsHelp")} error={form.formState.errors.accounts?.forbiddenReviewMaxHits?.message}>
+                <Input id="accounts-forbidden-review-max-hits" type="number" min={1} max={20} {...form.register("accounts.forbiddenReviewMaxHits", { valueAsNumber: true })} />
+              </SettingsField>
+              <SettingsField controlId="accounts-forbidden-review-final-action" label={t("settings.accounts.forbiddenReviewFinalAction")} description={t("settings.accounts.forbiddenReviewFinalActionHelp")} error={form.formState.errors.accounts?.forbiddenReviewFinalAction?.message}>
+                <Controller control={form.control} name="accounts.forbiddenReviewFinalAction" render={({ field }) => (
+                  <Select value={field.value} onValueChange={field.onChange}>
+                    <SelectTrigger id="accounts-forbidden-review-final-action" className="w-full max-w-xs">
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="disabled">{t("settings.accounts.forbiddenReviewFinalDisabled")}</SelectItem>
+                      <SelectItem value="reauthRequired">{t("settings.accounts.forbiddenReviewFinalReauth")}</SelectItem>
+                      <SelectItem value="delete">{t("settings.accounts.forbiddenReviewFinalDelete")}</SelectItem>
+                    </SelectContent>
+                  </Select>
+                )} />
+              </SettingsField>
             </div>
           </SettingsSection>
 

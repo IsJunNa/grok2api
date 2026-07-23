@@ -1,6 +1,7 @@
 package account
 
 import (
+	"strings"
 	"testing"
 	"time"
 )
@@ -33,5 +34,14 @@ func TestChatForbiddenMarkers(t *testing.T) {
 	}
 	if IsRecoveredChatForbiddenProbe("403-disabled:x", &past, now) {
 		t.Fatal("disabled is not recovered probe")
+	}
+	if ChatForbiddenHitCount("403:hits=3:anti-bot") != 3 {
+		t.Fatal("hit count parse")
+	}
+	if ChatForbiddenHitCount("403:legacy") != 1 {
+		t.Fatal("legacy hit count")
+	}
+	if !strings.HasPrefix(FormatChatForbiddenSuspend(2, "x"), "403:hits=2:") {
+		t.Fatal("format suspend")
 	}
 }

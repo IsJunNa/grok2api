@@ -241,6 +241,12 @@ type AccountsConfig struct {
 	ForbiddenProbeConcurrency   int
 	ForbiddenProbeBatchSize     int
 	ForbiddenProbeSkipSuspended bool
+	// ForbiddenReviewCooldown 每次 403 后的复核等待时长（默认 24h）。
+	ForbiddenReviewCooldown Duration
+	// ForbiddenReviewMaxHits 累计 403 次数达到该值后执行终态（默认 2，兼容旧「二次永久」）。
+	ForbiddenReviewMaxHits int
+	// ForbiddenReviewFinalAction: disabled | reauthRequired | delete。
+	ForbiddenReviewFinalAction string
 }
 
 type Secrets struct {
@@ -578,6 +584,17 @@ func (c Config) Validate() error {
 	if c.Accounts.ForbiddenProbeBatchSize < 10 || c.Accounts.ForbiddenProbeBatchSize > 1000 {
 		return errors.New("accounts.forbiddenProbeBatchSize 必须在 10 到 1000 之间")
 	}
+	if c.Accounts.ForbiddenReviewCooldown.Value() < time.Hour || c.Accounts.ForbiddenReviewCooldown.Value() > 168*time.Hour {
+		return errors.New("accounts.forbiddenReviewCooldown 必须在 1 小时到 168 小时之间")
+	}
+	if c.Accounts.ForbiddenReviewMaxHits < 1 || c.Accounts.ForbiddenReviewMaxHits > 20 {
+		return errors.New("accounts.forbiddenReviewMaxHits 必须在 1 到 20 之间")
+	}
+	switch c.Accounts.ForbiddenReviewFinalAction {
+	case "", "disabled", "reauthRequired", "delete":
+	default:
+		return errors.New("accounts.forbiddenReviewFinalAction 必须是 disabled、reauthRequired 或 delete")
+	}
 	return nil
 }
 
@@ -690,6 +707,9 @@ func defaultConfig() Config {
 			ForbiddenProbeConcurrency:   5,
 			ForbiddenProbeBatchSize:     100,
 			ForbiddenProbeSkipSuspended: true,
+			ForbiddenReviewCooldown:    Duration(24 * time.Hour),
+			ForbiddenReviewMaxHits:     2,
+			ForbiddenReviewFinalAction: "disabled",
 		},
 	}
 }

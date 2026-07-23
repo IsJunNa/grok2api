@@ -132,6 +132,9 @@ type AccountsConfig struct {
 	ForbiddenProbeConcurrency   int
 	ForbiddenProbeBatchSize     int
 	ForbiddenProbeSkipSuspended bool
+	ForbiddenReviewCooldown    string
+	ForbiddenReviewMaxHits     int
+	ForbiddenReviewFinalAction string
 }
 
 // EditableConfig 聚合管理端允许修改的运行参数。
@@ -405,6 +408,15 @@ func applyDomainConfig(base config.Config, value settingsdomain.Config) config.C
 	if value.Accounts.ForbiddenProbeConcurrency > 0 || value.Accounts.ForbiddenProbeBatchSize > 0 || value.Accounts.ForbiddenProbeInterval > 0 || value.Accounts.ForbiddenProbeEnabled {
 		base.Accounts.ForbiddenProbeSkipSuspended = value.Accounts.ForbiddenProbeSkipSuspended
 	}
+	if value.Accounts.ForbiddenReviewCooldown > 0 {
+		base.Accounts.ForbiddenReviewCooldown = config.Duration(value.Accounts.ForbiddenReviewCooldown)
+	}
+	if value.Accounts.ForbiddenReviewMaxHits > 0 {
+		base.Accounts.ForbiddenReviewMaxHits = value.Accounts.ForbiddenReviewMaxHits
+	}
+	if strings.TrimSpace(value.Accounts.ForbiddenReviewFinalAction) != "" {
+		base.Accounts.ForbiddenReviewFinalAction = strings.TrimSpace(value.Accounts.ForbiddenReviewFinalAction)
+	}
 	return base
 }
 
@@ -469,6 +481,9 @@ func toDomainConfig(value config.Config) settingsdomain.Config {
 			ForbiddenProbeConcurrency:   value.Accounts.ForbiddenProbeConcurrency,
 			ForbiddenProbeBatchSize:     value.Accounts.ForbiddenProbeBatchSize,
 			ForbiddenProbeSkipSuspended: value.Accounts.ForbiddenProbeSkipSuspended,
+			ForbiddenReviewCooldown:    value.Accounts.ForbiddenReviewCooldown.Value(),
+			ForbiddenReviewMaxHits:     value.Accounts.ForbiddenReviewMaxHits,
+			ForbiddenReviewFinalAction: value.Accounts.ForbiddenReviewFinalAction,
 		},
 	}
 }
@@ -555,6 +570,12 @@ func mergeEditable(current config.Config, input EditableConfig) (config.Config, 
 			next.Accounts.ForbiddenProbeBatchSize = input.Accounts.ForbiddenProbeBatchSize
 		}
 		next.Accounts.ForbiddenProbeSkipSuspended = input.Accounts.ForbiddenProbeSkipSuspended
+		if input.Accounts.ForbiddenReviewMaxHits > 0 {
+			next.Accounts.ForbiddenReviewMaxHits = input.Accounts.ForbiddenReviewMaxHits
+		}
+		if action := strings.TrimSpace(input.Accounts.ForbiddenReviewFinalAction); action != "" {
+			next.Accounts.ForbiddenReviewFinalAction = action
+		}
 	}
 
 	type durationInput struct {
@@ -595,6 +616,11 @@ func mergeEditable(current config.Config, input EditableConfig) (config.Config, 
 		if strings.TrimSpace(input.Accounts.ForbiddenProbeInterval) != "" {
 			durations = append(durations,
 				durationInput{"accounts.forbiddenProbeInterval", input.Accounts.ForbiddenProbeInterval, func(value config.Duration) { next.Accounts.ForbiddenProbeInterval = value }},
+			)
+		}
+		if strings.TrimSpace(input.Accounts.ForbiddenReviewCooldown) != "" {
+			durations = append(durations,
+				durationInput{"accounts.forbiddenReviewCooldown", input.Accounts.ForbiddenReviewCooldown, func(value config.Duration) { next.Accounts.ForbiddenReviewCooldown = value }},
 			)
 		}
 	}
@@ -670,6 +696,9 @@ func toEditable(cfg config.Config) EditableConfig {
 			ForbiddenProbeConcurrency:   cfg.Accounts.ForbiddenProbeConcurrency,
 			ForbiddenProbeBatchSize:     cfg.Accounts.ForbiddenProbeBatchSize,
 			ForbiddenProbeSkipSuspended: cfg.Accounts.ForbiddenProbeSkipSuspended,
+			ForbiddenReviewCooldown:    cfg.Accounts.ForbiddenReviewCooldown.String(),
+			ForbiddenReviewMaxHits:     cfg.Accounts.ForbiddenReviewMaxHits,
+			ForbiddenReviewFinalAction: cfg.Accounts.ForbiddenReviewFinalAction,
 		},
 		AccountsProvided: true,
 	}

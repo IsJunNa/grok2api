@@ -3,6 +3,7 @@ package account
 import (
 	"crypto/sha256"
 	"encoding/binary"
+	"fmt"
 	"strings"
 	"time"
 )
@@ -112,12 +113,14 @@ const (
 
 // 聊天上游 403 的账号健康标记（写入 LastError，避免额外 schema）。
 const (
-	// ChatForbiddenSuspendPrefix 表示 24h 临时封禁；到期后无需任务即可回到号池。
+	// ChatForbiddenSuspendPrefix 表示临时封禁；到期后无需任务即可回到号池。
 	ChatForbiddenSuspendPrefix = "403:"
-	// ChatForbiddenDisabledPrefix 表示恢复后再 403 后的永久停用。
+	// ChatForbiddenDisabledPrefix 表示达到复核上限后的永久停用。
 	ChatForbiddenDisabledPrefix = "403-disabled:"
-	// ChatForbiddenCooldown 是首次聊天 403 的默认隔离时长。
+	// ChatForbiddenCooldown 是首次聊天 403 的默认隔离时长（可被设置覆盖）。
 	ChatForbiddenCooldown = 24 * time.Hour
+	// ChatForbiddenHitsMarker 嵌入 LastError，记录累计 403 命中次数：403:hits=2:detail
+	ChatForbiddenHitsMarker = "hits="
 )
 
 // IsChatForbiddenSuspend 判断账号是否处于（或刚结束的）聊天 403 临时封禁标记。
@@ -130,7 +133,7 @@ func IsChatForbiddenSuspend(lastError string) bool {
 	return strings.HasPrefix(value, ChatForbiddenSuspendPrefix)
 }
 
-// IsChatForbiddenDisabled 判断账号是否因聊天 403 二次失败被永久停用。
+// IsChatForbiddenDisabled 判断账号是否因聊天 403 达到终态被永久停用。
 func IsChatForbiddenDisabled(lastError string) bool {
 	return strings.HasPrefix(strings.TrimSpace(lastError), ChatForbiddenDisabledPrefix)
 }
@@ -148,8 +151,8 @@ func IsActiveChatForbiddenCooldown(lastError string, cooldownUntil *time.Time, n
 	return now.Before(cooldownUntil.UTC())
 }
 
-// IsRecoveredChatForbiddenProbe 表示账号曾因 403 被封 24h，窗口已过且未成功清理标记，
-// 再次 403 时应永久停用。
+// IsRecoveredChatForbiddenProbe 表示账号曾因 403 被临时封禁，窗口已过且未成功清理标记，
+// 再次 403 时应计入下一次复核。
 func IsRecoveredChatForbiddenProbe(lastError string, cooldownUntil *time.Time, now time.Time) bool {
 	if !IsChatForbiddenSuspend(lastError) {
 		return false
@@ -158,6 +161,66 @@ func IsRecoveredChatForbiddenProbe(lastError string, cooldownUntil *time.Time, n
 		return false
 	}
 	return true
+}
+
+// ChatForbiddenHitCount 从 LastError 解析累计 403 命中次数；无标记时返回 0。
+// 支持 403:hits=2:detail / 403-disabled:hits=3:detail；旧格式 403:detail 视为 1。
+func ChatForbiddenHitCount(lastError string) int {
+	value := strings.TrimSpace(lastError)
+	if !IsChatForbiddenMarked(value) {
+		return 0
+	}
+	rest := value
+	if strings.HasPrefix(rest, ChatForbiddenDisabledPrefix) {
+		rest = rest[len(ChatForbiddenDisabledPrefix):]
+	} else if strings.HasPrefix(rest, ChatForbiddenSuspendPrefix) {
+		rest = rest[len(ChatForbiddenSuspendPrefix):]
+	}
+	if strings.HasPrefix(rest, ChatForbiddenHitsMarker) {
+		rest = rest[len(ChatForbiddenHitsMarker):]
+		end := 0
+		for end < len(rest) && rest[end] >= '0' && rest[end] <= '9' {
+			end++
+		}
+		if end > 0 {
+			n := 0
+			for i := 0; i < end; i++ {
+				n = n*10 + int(rest[i]-'0')
+			}
+			if n > 0 {
+				return n
+			}
+		}
+	}
+	// 兼容旧标记：无 hits= 时按 1 次计。
+	return 1
+}
+
+// FormatChatForbiddenSuspend 生成带命中次数的临时封禁 LastError。
+func FormatChatForbiddenSuspend(hits int, detail string) string {
+	return formatChatForbiddenError(ChatForbiddenSuspendPrefix, hits, detail)
+}
+
+// FormatChatForbiddenDisabled 生成带命中次数的永久停用 LastError。
+func FormatChatForbiddenDisabled(hits int, detail string) string {
+	return formatChatForbiddenError(ChatForbiddenDisabledPrefix, hits, detail)
+}
+
+func formatChatForbiddenError(prefix string, hits int, detail string) string {
+	detail = strings.TrimSpace(detail)
+	if hits < 1 {
+		hits = 1
+	}
+	var reason string
+	if detail == "" {
+		reason = fmt.Sprintf("%s%s%d", prefix, ChatForbiddenHitsMarker, hits)
+	} else {
+		reason = fmt.Sprintf("%s%s%d:%s", prefix, ChatForbiddenHitsMarker, hits, detail)
+	}
+	if len(reason) > 512 {
+		reason = reason[:512]
+	}
+	return reason
 }
 
 // EgressAssignmentMode 表示账号出口节点的维护方式。手工绑定绝不会被

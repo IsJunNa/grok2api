@@ -95,6 +95,9 @@ type AccountSummary struct {
 	Cooldown       int64
 	WaitingReset   int64
 	Probing        int64
+	// Forbidden 含 403 临时封禁与 403 永久停用（与 status=forbidden 筛选一致）。
+	Forbidden      int64
+	// Disabled 为普通停用，不含 403-disabled 以免与 Forbidden 重复。
 	Disabled       int64
 	ReauthRequired int64
 }

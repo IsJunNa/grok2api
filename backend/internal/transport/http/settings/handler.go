@@ -131,6 +131,9 @@ type accountsConfigDTO struct {
 	ForbiddenProbeConcurrency   int    `json:"forbiddenProbeConcurrency"`
 	ForbiddenProbeBatchSize     int    `json:"forbiddenProbeBatchSize"`
 	ForbiddenProbeSkipSuspended bool   `json:"forbiddenProbeSkipSuspended"`
+	ForbiddenReviewCooldown    string `json:"forbiddenReviewCooldown"`
+	ForbiddenReviewMaxHits     int    `json:"forbiddenReviewMaxHits"`
+	ForbiddenReviewFinalAction string `json:"forbiddenReviewFinalAction"`
 }
 
 type settingsResponse struct {
@@ -245,6 +248,9 @@ func (value settingsConfigDTO) toApplication() settingsapp.EditableConfig {
 			ForbiddenProbeConcurrency:   value.Accounts.ForbiddenProbeConcurrency,
 			ForbiddenProbeBatchSize:     value.Accounts.ForbiddenProbeBatchSize,
 			ForbiddenProbeSkipSuspended: value.Accounts.ForbiddenProbeSkipSuspended,
+			ForbiddenReviewCooldown:    value.Accounts.ForbiddenReviewCooldown,
+			ForbiddenReviewMaxHits:     value.Accounts.ForbiddenReviewMaxHits,
+			ForbiddenReviewFinalAction: value.Accounts.ForbiddenReviewFinalAction,
 		}
 		result.AccountsProvided = true
 	}
@@ -314,6 +320,9 @@ func newSettingsResponse(value settingsapp.Snapshot) settingsResponse {
 				ForbiddenProbeConcurrency:   config.Accounts.ForbiddenProbeConcurrency,
 				ForbiddenProbeBatchSize:     config.Accounts.ForbiddenProbeBatchSize,
 				ForbiddenProbeSkipSuspended: config.Accounts.ForbiddenProbeSkipSuspended,
+				ForbiddenReviewCooldown:    config.Accounts.ForbiddenReviewCooldown,
+				ForbiddenReviewMaxHits:     config.Accounts.ForbiddenReviewMaxHits,
+				ForbiddenReviewFinalAction: config.Accounts.ForbiddenReviewFinalAction,
 			},
 		},
 		RecommendedProviderBuild: providerBuildRecommendationDTO{
